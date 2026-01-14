@@ -1,15 +1,16 @@
-from jose import jwt
+# app/auth.py
 from passlib.context import CryptContext
 from datetime import datetime, timedelta
+from jose import JWTError, jwt
 
-# 보안 설정 (나중에 .env로 빼야 함)
-SECRET_KEY = "your-secret-key-very-secret"
+# argon2를 사용하도록 설정 (bcrypt 버그 회피용)
+pwd_context = CryptContext(schemes=["argon2"], deprecated="auto")
+
+SECRET_KEY = "your-secret-key"  # 실제 서비스 시 환경변수로 관리
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 # 1일
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
-def get_password_hash(password):
+def get_password_hash(password: str):
     return pwd_context.hash(password)
 
 def verify_password(plain_password, hashed_password):

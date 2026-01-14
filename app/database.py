@@ -3,7 +3,7 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 
 # DB 주소 (나중에 Docker/RDS 주소로 변경)
-SQLALCHEMY_DATABASE_URL = "postgresql://유저명:비밀번호@localhost/DB이름"
+SQLALCHEMY_DATABASE_URL = "postgresql://postgres:postgres@localhost:5433/testdb"
 
 engine = create_engine(SQLALCHEMY_DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
