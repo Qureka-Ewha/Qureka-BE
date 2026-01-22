@@ -40,3 +40,16 @@ def login(form_data: schemas.UserLogin, db: Session = Depends(database.get_db)):
     
     access_token = auth.create_access_token(data={"sub": user.email})
     return {"access_token": access_token, "token_type": "bearer"}
+
+# 1. 블랙리스트 저장소 (서버가 켜져 있는 동안만 유지되는 임시 저장소)
+token_blacklist = set()
+
+# 2. 로그아웃 API
+@app.post("/logout")
+def logout(token: str = Depends(auth.oauth2_scheme)):
+    """
+    리액트에서 로그아웃 버튼을 누르면 이 API를 호출합니다.
+    서버는 받은 토큰을 블랙리스트에 넣어 이후 사용을 막습니다.
+    """
+    token_blacklist.add(token)
+    return {"message": "Successfully logged out"}
