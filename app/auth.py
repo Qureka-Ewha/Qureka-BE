@@ -2,6 +2,10 @@
 from passlib.context import CryptContext
 from datetime import datetime, timedelta
 from jose import JWTError, jwt
+from fastapi.security import OAuth2PasswordBearer
+
+#logout
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
 # argon2를 사용하도록 설정 (bcrypt 버그 회피용)
 pwd_context = CryptContext(schemes=["argon2"], deprecated="auto")

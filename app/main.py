@@ -1,7 +1,8 @@
 # app/main.py
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, File, UploadFile, Depends, HTTPException
 from sqlalchemy.orm import Session
 from . import models, schemas, auth, database
+from .services.pdf_processing import extract_text_from_pdf
 
 app = FastAPI()
 
@@ -53,3 +54,19 @@ def logout(token: str = Depends(auth.oauth2_scheme)):
     """
     token_blacklist.add(token)
     return {"message": "Successfully logged out"}
+
+
+# 파일 업로드 및 텍스트 추출 API
+@app.post("/upload/pdf")
+async def upload_pdf(file: UploadFile = File(...)):
+    # 1. 업로드된 파일의 내용을 읽습니다.
+    content = await file.read()
+    
+    # 2. 아까 만든 함수로 텍스트를 뽑습니다.
+    extracted_text = extract_text_from_pdf(content)
+    
+    # 3. 결과를 JSON으로 돌려줍니다.
+    return {
+        "filename": file.filename,
+        "text": extracted_text
+    }
