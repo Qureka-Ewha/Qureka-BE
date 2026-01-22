@@ -3,6 +3,9 @@ from fastapi import FastAPI, File, UploadFile, Depends, HTTPException
 from sqlalchemy.orm import Session
 from . import models, schemas, auth, database
 from .services.pdf_processing import extract_text_from_pdf
+import shutil
+import os
+from .services.audio_processing import transcribe_long_audio
 
 app = FastAPI()
 
@@ -66,6 +69,26 @@ async def upload_pdf(file: UploadFile = File(...)):
     extracted_text = extract_text_from_pdf(content)
     
     # 3. 결과를 JSON으로 돌려줍니다.
+    return {
+        "filename": file.filename,
+        "text": extracted_text
+    }
+
+@app.post("/upload/audio")
+async def upload_audio(file: UploadFile = File(...)):
+    # 1. 임시 저장 폴더 확인
+    temp_dir = "app/temp"
+    if not os.path.exists(temp_dir):
+        os.makedirs(temp_dir)
+        
+    # 2. 업로드된 파일 저장
+    file_path = os.path.join(temp_dir, file.filename)
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+    
+    # 3. 긴 음성 처리 함수 실행
+    extracted_text = transcribe_long_audio(file_path)
+    
     return {
         "filename": file.filename,
         "text": extracted_text

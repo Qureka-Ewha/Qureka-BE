@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual environment
+venv/
+
+# Environment variables
+.env
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+pgdata/
+
+# --- 프로젝트 특화 추가 항목 ---
+
+# 음성/이미지 처리 임시 폴더 (내부의 대용량 파일 방지)
+app/temp/
+uploads/
+
+# 미디어 파일 (실수로 소스 코드와 함께 올라가는 것 방지)
+*.mp3
+*.wav
+*.m4a
+*.flac
+*.jpg
+*.jpeg
+*.png
+*.pdf
+
+# AI 모델 캐시 (Whisper 등이 다운로드하는 모델 파일)
+.cache/
