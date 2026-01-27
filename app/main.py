@@ -86,10 +86,14 @@ async def upload_audio(file: UploadFile = File(...)):
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
     
-    # 3. 긴 음성 처리 함수 실행
-    extracted_text = transcribe_long_audio(file_path)
+    # 3. 파일명에서 힌트 추출 (확장자 제거)
+    subject_hint = os.path.splitext(file.filename)[0]
+    
+    # 4. 긴 음성 처리 함수 실행 (힌트 포함)
+    extracted_text = transcribe_long_audio(file_path, subject_hint)
     
     return {
         "filename": file.filename,
+        "subject_hint": subject_hint,
         "text": extracted_text
     }
