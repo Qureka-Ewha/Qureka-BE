@@ -1,27 +1,36 @@
-# app/main.py
-from fastapi import FastAPI, File, UploadFile, Depends, HTTPException
-from sqlalchemy.orm import Session
-from . import models, schemas, auth, database
-from .services.pdf_processing import extract_text_from_pdf
-import shutil
 import os
-from .services.audio_processing import transcribe_long_audio
+import openai
+from fastapi import FastAPI, Depends, HTTPException
+from sqlalchemy.orm import Session
+from dotenv import load_dotenv
 
-app = FastAPI()
+# 우리가 정리한 파일들 임포트
+from . import models, schemas, auth, database
+from .routes import upload  
 
-# 서버 시작 시 테이블 자동 생성 (1주 차 개발 단계에서 유용)
+# 1. 환경 설정
+load_dotenv()
+openai.api_key = os.getenv("OPENAI_API_KEY")
+
+app = FastAPI(title="Qureka Unified Server")
+
+# 2. 서버 실행 시 DB 테이블 자동 생성
 models.Base.metadata.create_all(bind=database.engine)
 
-@app.get("/")
-def root():
-    return {"message": "Qureka Auth System is Running!"}
+# 3. 로그아웃을 위한 블랙리스트 저장소 (개발자 1 로직)
+# 서버가 켜져 있는 동안 메모리에 토큰을 저장하여 무효화합니다.
+token_blacklist = set()
 
-# 회원가입 API
+# 4. 라우터 연결
+app.include_router(upload.router, prefix="/files", tags=["Lecture Files"])
+
+# --- 인증 관련 API (개발자 1 코드 풀버전 통합) ---
+
 @app.post("/signup")
 def signup(user: schemas.UserCreate, db: Session = Depends(database.get_db)):
     db_user = db.query(models.User).filter(models.User.email == user.email).first()
     if db_user:
-        raise HTTPException(status_code=400, detail="이미 등록된 이메일입니다.")
+        raise HTTPException(status_code=400, detail="이미 가입된 이메일입니다.")
     
     hashed_pwd = auth.get_password_hash(user.password)
     new_user = models.User(
@@ -33,67 +42,26 @@ def signup(user: schemas.UserCreate, db: Session = Depends(database.get_db)):
     )
     db.add(new_user)
     db.commit()
-    return {"message": "회원가입이 완료되었습니다."}
+    return {"message": "회원가입 성공"}
 
-# 로그인 API
 @app.post("/login", response_model=schemas.Token)
 def login(form_data: schemas.UserLogin, db: Session = Depends(database.get_db)):
     user = db.query(models.User).filter(models.User.email == form_data.email).first()
     if not user or not auth.verify_password(form_data.password, user.hashed_password):
-        raise HTTPException(status_code=401, detail="이메일 또는 비밀번호가 틀렸습니다.")
+        raise HTTPException(status_code=401, detail="로그인 정보가 올바르지 않습니다.")
     
     access_token = auth.create_access_token(data={"sub": user.email})
     return {"access_token": access_token, "token_type": "bearer"}
 
-# 1. 블랙리스트 저장소 (서버가 켜져 있는 동안만 유지되는 임시 저장소)
-token_blacklist = set()
-
-# 2. 로그아웃 API
+# 추가된 로그아웃 API (개발자 1 로직)
 @app.post("/logout")
 def logout(token: str = Depends(auth.oauth2_scheme)):
     """
-    리액트에서 로그아웃 버튼을 누르면 이 API를 호출합니다.
-    서버는 받은 토큰을 블랙리스트에 넣어 이후 사용을 막습니다.
+    사용자가 보낸 토큰을 블랙리스트에 넣어, 이 토큰으로 더 이상 API를 호출하지 못하게 차단합니다.
     """
     token_blacklist.add(token)
     return {"message": "Successfully logged out"}
 
-
-# 파일 업로드 및 텍스트 추출 API
-@app.post("/upload/pdf")
-async def upload_pdf(file: UploadFile = File(...)):
-    # 1. 업로드된 파일의 내용을 읽습니다.
-    content = await file.read()
-    
-    # 2. 아까 만든 함수로 텍스트를 뽑습니다.
-    extracted_text = extract_text_from_pdf(content)
-    
-    # 3. 결과를 JSON으로 돌려줍니다.
-    return {
-        "filename": file.filename,
-        "text": extracted_text
-    }
-
-@app.post("/upload/audio")
-async def upload_audio(file: UploadFile = File(...)):
-    # 1. 임시 저장 폴더 확인
-    temp_dir = "app/temp"
-    if not os.path.exists(temp_dir):
-        os.makedirs(temp_dir)
-        
-    # 2. 업로드된 파일 저장
-    file_path = os.path.join(temp_dir, file.filename)
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-    
-    # 3. 파일명에서 힌트 추출 (확장자 제거)
-    subject_hint = os.path.splitext(file.filename)[0]
-    
-    # 4. 긴 음성 처리 함수 실행 (힌트 포함)
-    extracted_text = transcribe_long_audio(file_path, subject_hint)
-    
-    return {
-        "filename": file.filename,
-        "subject_hint": subject_hint,
-        "text": extracted_text
-    }
+@app.get("/")
+def root():
+    return {"status": "running", "message": "Qureka API 통합 서버가 가동 중입니다."}
