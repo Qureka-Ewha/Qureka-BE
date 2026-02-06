@@ -1,31 +1,41 @@
 import os
-import openai
 from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy.orm import Session
+from sqlalchemy import text  # 확장 설치를 위해 추가
 from dotenv import load_dotenv
 
-# 우리가 정리한 파일들 임포트
+# 내부 모듈 임포트
 from . import models, schemas, auth, database
-from .routes import upload  
+from .routes import upload 
 
-# 1. 환경 설정
+# 1. 환경 설정 로드
 load_dotenv()
 
 app = FastAPI(title="Qureka Unified Server")
 
-# 2. 서버 실행 시 DB 테이블 자동 생성
-models.Base.metadata.create_all(bind=database.engine)
+# 2. 서버 실행 시 DB 준비 (확장 설치 및 테이블 생성)
+@app.on_event("startup")
+def startup_event():
+    """
+    서버가 시작될 때 데이터베이스에 필요한 기능을 활성화하고 테이블을 생성합니다.
+    """
+    with database.engine.connect() as conn:
+        # 1) pgvector 확장 설치 (에러의 핵심 해결책)
+        conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+        conn.commit()
+    
+    # 2) 테이블 자동 생성
+    models.Base.metadata.create_all(bind=database.engine)
 
-# 3. 로그아웃을 위한 블랙리스트 저장소 (개발자 1 로직)
-# 서버가 켜져 있는 동안 메모리에 토큰을 저장하여 무효화합니다.
+# 3. 로그아웃을 위한 블랙리스트 저장소
 token_blacklist = set()
 
 # 4. 라우터 연결
 app.include_router(upload.router, prefix="/files", tags=["Lecture Files"])
 
-# --- 인증 관련 API (개발자 1 코드 풀버전 통합) ---
+# --- 인증 관련 API ---
 
-@app.post("/signup")
+@app.post("/signup", tags=["Auth"])
 def signup(user: schemas.UserCreate, db: Session = Depends(database.get_db)):
     db_user = db.query(models.User).filter(models.User.email == user.email).first()
     if db_user:
@@ -43,7 +53,7 @@ def signup(user: schemas.UserCreate, db: Session = Depends(database.get_db)):
     db.commit()
     return {"message": "회원가입 성공"}
 
-@app.post("/login", response_model=schemas.Token)
+@app.post("/login", response_model=schemas.Token, tags=["Auth"])
 def login(form_data: schemas.UserLogin, db: Session = Depends(database.get_db)):
     user = db.query(models.User).filter(models.User.email == form_data.email).first()
     if not user or not auth.verify_password(form_data.password, user.hashed_password):
@@ -52,15 +62,11 @@ def login(form_data: schemas.UserLogin, db: Session = Depends(database.get_db)):
     access_token = auth.create_access_token(data={"sub": user.email})
     return {"access_token": access_token, "token_type": "bearer"}
 
-# 추가된 로그아웃 API (개발자 1 로직)
-@app.post("/logout")
+@app.post("/logout", tags=["Auth"])
 def logout(token: str = Depends(auth.oauth2_scheme)):
-    """
-    사용자가 보낸 토큰을 블랙리스트에 넣어, 이 토큰으로 더 이상 API를 호출하지 못하게 차단합니다.
-    """
     token_blacklist.add(token)
     return {"message": "Successfully logged out"}
 
-@app.get("/")
+@app.get("/", tags=["Health"])
 def root():
     return {"status": "running", "message": "Qureka API 통합 서버가 가동 중입니다."}
