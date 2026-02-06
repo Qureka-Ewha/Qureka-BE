@@ -10,7 +10,6 @@ from .routes import upload
 
 # 1. 환경 설정
 load_dotenv()
-openai.api_key = os.getenv("OPENAI_API_KEY")
 
 app = FastAPI(title="Qureka Unified Server")
 

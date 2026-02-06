@@ -21,19 +21,30 @@ def process_file_chunks(file_id: int):
         if not file_rec or not file_rec.text_content:
             return
 
-        # 1. 텍스트를 의미 단위로 분할 (processing.py 엔진)
-        chunks = processing.chunk_text(file_rec.text_content)
-        # 2. 벡터 변환 (processing.py 엔진)
-        embeddings = processing.get_embeddings(chunks)
+        # 1. 텍스트 분할 시 이제 (내용, 페이지번호) 쌍을 받습니다.
+        # 기존 extract_from_pdf가 List[Tuple]을 반환하도록 processing.py를 수정했으므로
+        # 여기서는 text_content를 기반으로 하되, PDF일 경우 재추출하여 페이지 정보를 가져오는 것이 정확합니다.
+        if file_rec.file_url.lower().endswith(".pdf"):
+            with open(file_rec.file_url, "rb") as f:
+                pages_data = processing.extract_from_pdf(f.read())
+            chunks_with_page = processing.chunk_text_with_page(pages_data)
+        else:
+            # 오디오 등은 페이지가 없으므로 기본값 1 부여
+            chunks = processing.chunk_text(file_rec.text_content)
+            chunks_with_page = [(c, 1) for c in chunks]
 
-        # 3. DB 저장 (페이지 번호 포함)
-        for i, (content, emb) in enumerate(zip(chunks, embeddings)):
+        # 2. 벡터 변환 (텍스트 내용만 추출해서 보냄)
+        texts_only = [c[0] for c in chunks_with_page]
+        embeddings = processing.get_embeddings(texts_only)
+
+        # 3. DB 저장 (실제 페이지 번호 반영)
+        for (content, real_page), emb in zip(chunks_with_page, embeddings):
             new_chunk = models.LectureChunk(
                 lecture_id=file_rec.lecture_id,
                 file_id=file_id,
                 content=content,
                 embedding=emb,
-                page_number=i + 1  # 순차적으로 페이지 번호 부여
+                page_number=real_page  # i+1 대신 실제 추출된 페이지 번호 사용
             )
             db.add(new_chunk)
         
@@ -42,7 +53,7 @@ def process_file_chunks(file_id: int):
         db.close()
 
 # ---------------------------------------------------------
-# 1️⃣ [POST] 파일 업로드 및 텍스트 추출 (개발자 2 구조 + 개발자 1 엔진)
+# 1️⃣ [POST] 파일 업로드 및 텍스트 추출
 # ---------------------------------------------------------
 @router.post("/upload")
 async def upload_file(
@@ -50,29 +61,27 @@ async def upload_file(
     file: UploadFile = File(...), 
     db: Session = Depends(get_db)
 ):
-    # 1. 파일 물리적 저장
     file_path = os.path.join(UPLOAD_DIR, file.filename)
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
-    # 2. 엔진 가동 (개발자 1의 고성능 엔진 호출)
     if file.filename.lower().endswith(".pdf"):
         with open(file_path, "rb") as f:
-            raw_text = processing.extract_from_pdf(f.read())
+            # extract_from_pdf가 이제 List[Tuple]을 반환하므로 텍스트만 합쳐서 저장
+            pages_data = processing.extract_from_pdf(f.read())
+            raw_text = "\n".join([p[0] for p in pages_data])
     elif file.filename.lower().endswith((".mp3", ".wav", ".m4a")):
         raw_text = processing.extract_from_audio(file_path, subject_hint=lecture_title)
     else:
         raise HTTPException(status_code=400, detail="지원하지 않는 파일 형식입니다.")
 
-    # 3. 강의(Lecture) 찾기 또는 자동 생성 (개발자 2 로직)
     lecture = db.query(models.Lecture).filter(models.Lecture.title == lecture_title).first()
     if not lecture:
-        lecture = models.Lecture(title=lecture_title, user_id=1) # 임시 user_id 1
+        lecture = models.Lecture(title=lecture_title, user_id=1) 
         db.add(lecture)
         db.commit()
         db.refresh(lecture)
 
-    # 4. 업로드 파일 정보 저장 (is_confirmed=False)
     new_file = models.UploadedFile(
         lecture_id=lecture.id,
         file_url=file_path,
@@ -91,7 +100,7 @@ async def upload_file(
     }
 
 # ---------------------------------------------------------
-# 2️⃣ [PUT] 중간 저장 API (개발자 2 로직)
+# 2️⃣ [PUT] 중간 저장 API
 # ---------------------------------------------------------
 @router.put("/upload/{file_id}/text")
 async def update_text(file_id: int, text_content: str = Form(...), db: Session = Depends(get_db)):
@@ -107,7 +116,7 @@ async def update_text(file_id: int, text_content: str = Form(...), db: Session =
     return {"message": "임시 저장되었습니다."}
 
 # ---------------------------------------------------------
-# 3️⃣ [POST] 최종 확정 API (임베딩 시작)
+# 3️⃣ [POST] 최종 확정 API
 # ---------------------------------------------------------
 @router.post("/confirm/{file_id}")
 async def confirm_file(file_id: int, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
@@ -118,6 +127,5 @@ async def confirm_file(file_id: int, background_tasks: BackgroundTasks, db: Sess
     file_rec.is_confirmed = True
     db.commit()
 
-    # 무거운 작업은 백그라운드에서 실행
     background_tasks.add_task(process_file_chunks, file_id)
     return {"message": "확정 완료! AI가 자료 학습을 시작합니다."}
