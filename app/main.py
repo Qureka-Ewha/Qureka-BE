@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 
 # 내부 모듈 임포트
 from . import models, schemas, auth, database
-from .routes import upload 
+from .routes import upload, chat
 
 # 1. 환경 설정 로드
 load_dotenv()
@@ -70,3 +70,6 @@ def logout(token: str = Depends(auth.oauth2_scheme)):
 @app.get("/", tags=["Health"])
 def root():
     return {"status": "running", "message": "Qureka API 통합 서버가 가동 중입니다."}
+
+app.include_router(upload.router, prefix="/files", tags=["Lecture Files"])
+app.include_router(chat.router, prefix="/chat", tags=["Tutoring Chat"])

@@ -24,12 +24,9 @@ def process_file_chunks(file_id: int):
         # PDF일 경우 시각적 분석 기반으로 재추출하여 페이지 정보 확보
         if file_rec.file_url.lower().endswith(".pdf"):
             with open(file_rec.file_url, "rb") as f:
-                # [중요] processing.py에서 수정한 extract_from_pdf 호출
                 pages_data = processing.extract_from_pdf(f.read())
             chunks_with_page = processing.chunk_text_with_page(pages_data)
         else:
-            # 오디오 등은 페이지가 없으므로 기본값 1 부여
-            # (processing.py에 chunk_text가 없다면 chunk_text_with_page를 활용하도록 수정 가능)
             chunks_with_page = [(file_rec.text_content, 1)]
 
         # 벡터 변환
@@ -52,7 +49,7 @@ def process_file_chunks(file_id: int):
         db.close()
 
 # ---------------------------------------------------------
-# 1️⃣ [POST] 파일 업로드 및 텍스트 추출 (Gemini Vision 강제)
+# 1️⃣ [POST] 파일 업로드 및 텍스트 추출
 # ---------------------------------------------------------
 @router.post("/upload")
 async def upload_file(
@@ -60,25 +57,21 @@ async def upload_file(
     file: UploadFile = File(...), 
     db: Session = Depends(get_db)
 ):
-    # 파일 저장
     file_path = os.path.join(UPLOAD_DIR, file.filename)
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
-    # 텍스트 추출 로직
     if file.filename.lower().endswith(".pdf"):
         print(f"📡 PDF 업로드 감지: Gemini Vision 분석 시작 - {file.filename}")
         with open(file_path, "rb") as f:
-            # [핵심] processing.py의 Vision 전용 함수 호출
             pages_data = processing.extract_from_pdf(f.read())
-            # 손글씨가 포함된 전체 텍스트 합치기
             raw_text = "\n".join([p[0] for p in pages_data])
     elif file.filename.lower().endswith((".mp3", ".wav", ".m4a")):
-        raw_text = processing.transcribe_audio(file_path) # 함수명 통일 확인 필요
+        raw_text = processing.transcribe_audio(file_path)
     else:
         raise HTTPException(status_code=400, detail="지원하지 않는 파일 형식입니다.")
 
-    # 강의(Lecture) 레코드 확인 및 생성
+    # 강의(Lecture) 레코드 확인 및 생성 (user_id=1은 임시, 추후 로그인 정보로 대체 가능)
     lecture = db.query(models.Lecture).filter(models.Lecture.title == lecture_title).first()
     if not lecture:
         lecture = models.Lecture(title=lecture_title, user_id=1) 
@@ -86,7 +79,6 @@ async def upload_file(
         db.commit()
         db.refresh(lecture)
 
-    # 업로드 파일 레코드 생성
     new_file = models.UploadedFile(
         lecture_id=lecture.id,
         file_url=file_path,
@@ -104,7 +96,9 @@ async def upload_file(
         "extracted_text": raw_text
     }
 
-# (이하 update_text, confirm_file API는 기존과 동일하여 생략 가능하지만 구조 유지를 위해 포함)
+# ---------------------------------------------------------
+# 2️⃣ [PUT] 텍스트 수정 (임시 저장)
+# ---------------------------------------------------------
 @router.put("/upload/{file_id}/text")
 async def update_text(file_id: int, text_content: str = Form(...), db: Session = Depends(get_db)):
     file_rec = db.query(models.UploadedFile).filter_by(id=file_id).first()
@@ -113,11 +107,59 @@ async def update_text(file_id: int, text_content: str = Form(...), db: Session =
     db.commit()
     return {"message": "임시 저장되었습니다."}
 
+# ---------------------------------------------------------
+# 3️⃣ [POST] 파일 확정 및 소크라테스 대화 시작
+# ---------------------------------------------------------
 @router.post("/confirm/{file_id}")
 async def confirm_file(file_id: int, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    # 1. 파일 및 관련 사용자 정보 로드
     file_rec = db.query(models.UploadedFile).filter_by(id=file_id).first()
     if not file_rec: raise HTTPException(status_code=404)
+    
+    # 이 파일을 소유한 사용자의 정보 가져오기
+    user = file_rec.lecture.user 
+    
+    # 2. 확정 상태 업데이트
     file_rec.is_confirmed = True
     db.commit()
+
+    # 3. 백그라운드 임베딩 작업 시작
     background_tasks.add_task(process_file_chunks, file_id)
-    return {"message": "확정 완료!"}
+
+    # 4. [핵심] 사용자의 학과/학년 정보를 반영한 첫 질문 생성
+    # 이미 해당 강의에 세션이 있다면 새로 만들지 않음
+    existing_session = db.query(models.ChatSession).filter_by(lecture_id=file_rec.lecture_id).first()
+    
+    if not existing_session:
+        # processing.py의 수정된 함수 호출 (학과, 학년 전달)
+        first_question = processing.generate_initial_question(
+            full_text=file_rec.text_content,
+            dept=user.department,
+            grade=user.grade
+        )
+
+        # 대화 세션(ChatSession) 생성
+        new_session = models.ChatSession(
+            lecture_id=file_rec.lecture_id,
+            title=f"{file_rec.lecture.title} - AI 튜터링"
+        )
+        db.add(new_session)
+        db.commit()
+        db.refresh(new_session)
+
+        # AI의 첫 번째 메시지 저장
+        ai_message = models.ChatMessage(
+            session_id=new_session.id,
+            role="assistant",
+            content=first_question
+        )
+        db.add(ai_message)
+        db.commit()
+
+        return {
+            "message": "확정 완료! AI 튜터 Qureka가 첫 질문을 보냈습니다.",
+            "session_id": new_session.id,
+            "first_question": first_question
+        }
+
+    return {"message": "확정 완료! 기존 대화 세션에서 계속 학습하세요."}
