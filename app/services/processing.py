@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Gemini 설정 (SDK 1.0.0+ 기준)
-client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+client = genai.Client(api_key = os.getenv("GEMINI_API_KEY"), http_options={"api_version": "v1"})
 STT_MODEL = whisper.load_model("turbo")
 
 # -------------------------------------------------
@@ -34,7 +34,7 @@ def ocr_with_gemini(page) -> str:
     
     # 모델명에서 'models/' 접두사를 제거하여 404 에러 방지
     response = client.models.generate_content(
-        model='gemini-1.5-flash-latest', 
+        model="models/gemini-2.5-flash", 
         contents=[
             types.Part.from_bytes(data=img_data, mime_type='image/png'),
             prompt
@@ -152,7 +152,7 @@ def generate_initial_question(full_text: str, dept: str, grade: int) -> str:
     
     try:
         response = client.models.generate_content(
-            model='gemini-1.5-flash',
+            model="models/gemini-2.5-flash",
             contents=[prompt]
         )
         return response.text
@@ -177,7 +177,7 @@ def generate_chat_response(context_text: str, chat_history: str, dept: str, grad
     
     try:
         response = client.models.generate_content(
-            model='gemini-1.5-flash',
+            model="models/gemini-2.5-flash",
             contents=[prompt]
         )
         return response.text
