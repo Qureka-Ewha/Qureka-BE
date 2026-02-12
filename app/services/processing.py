@@ -14,7 +14,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Gemini 설정
-client = genai.Client(api_key="AIzaSyBe_xJF3lsPCEe6Jnjt7420cCOXAqExoo8")
+client = genai.Client(api_key="AIzaSyCmF5rhet3nPXxn7FN5sICAX4bS4bJYdD8")
+
+
 STT_MODEL = whisper.load_model("turbo")
 
 # -------------------------------------------------
@@ -22,8 +24,8 @@ STT_MODEL = whisper.load_model("turbo")
 # -------------------------------------------------
 def ocr_with_gemini(page) -> str:
     """PDF 텍스트 레이어를 무시하고 이미지를 직접 시각 분석"""
-    # 해상도를 3.5배로 높여 필기 인식률 극대화 (작은 글씨도 잘 보이게 함)
-    pix = page.get_pixmap(matrix=fitz.Matrix(3.5, 3.5)) 
+    # 해상도를 살짝 낮춰 토큰 절약
+    pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0)) 
     img_data = pix.tobytes("png")
     
     prompt = """
@@ -35,7 +37,7 @@ def ocr_with_gemini(page) -> str:
     
     # 모델명은 라이브러리 버전에 맞게 'gemini-1.5-flash'로 설정
     response = client.models.generate_content(
-        model='gemini-1.5-flash', 
+        model='models/gemini-flash-latest', 
         contents=[
             types.Part.from_bytes(data=img_data, mime_type='image/png'),
             prompt
@@ -63,8 +65,8 @@ def extract_from_pdf(file_bytes: bytes) -> List[Tuple[str, int]]:
             
         except Exception as e:
             print(f"❌ API 에러 발생: {e}")
-            # API 에러 시에만 어쩔 수 없이 텍스트 레이어 호출 (보험용)
-            text = page.get_text().strip()
+            # text = page.get_text().strip()  <-- 이 줄을 #으로 주석 처리하세요!
+            text = f"에러 발생으로 분석 실패: {e}" # 에러 내용을 확인하기 위해
         
         if text:
             pages_data.append((text, page_num))
