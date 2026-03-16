@@ -54,13 +54,16 @@ def process_file_chunks(file_id: int):
 @router.post("/upload")
 async def upload_file(
     lecture_title: str = Form(...), 
+    user_id: int = Form(...), # ✅ 테스트를 위해 프론트에서 user_id를 받도록 추가
     file: UploadFile = File(...), 
     db: Session = Depends(get_db)
 ):
+    # 파일 저장 경로 설정
     file_path = os.path.join(UPLOAD_DIR, file.filename)
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
+    # 텍스트 추출 로직 (Gemini Vision 등)
     if file.filename.lower().endswith(".pdf"):
         print(f"📡 PDF 업로드 감지: Gemini Vision 분석 시작 - {file.filename}")
         with open(file_path, "rb") as f:
@@ -71,14 +74,21 @@ async def upload_file(
     else:
         raise HTTPException(status_code=400, detail="지원하지 않는 파일 형식입니다.")
 
-    # 강의(Lecture) 레코드 확인 및 생성 (user_id=1은 임시, 추후 로그인 정보로 대체 가능)
-    lecture = db.query(models.Lecture).filter(models.Lecture.title == lecture_title).first()
+    # ✅ [핵심 수정] 강의(Lecture) 확인 시 '제목'과 '유저 ID'를 함께 조회
+    # 이렇게 해야 홍길동의 '소공'과 jiony의 '소공'이 분리됩니다.
+    lecture = db.query(models.Lecture).filter(
+        models.Lecture.title == lecture_title,
+        models.Lecture.user_id == user_id
+    ).first()
+
+    # 해당 유저의 강의가 없다면 새로 생성
     if not lecture:
-        lecture = models.Lecture(title=lecture_title, user_id=1) 
+        lecture = models.Lecture(title=lecture_title, user_id=user_id) # ✅ user_id 반영
         db.add(lecture)
         db.commit()
         db.refresh(lecture)
 
+    # 파일 정보 저장
     new_file = models.UploadedFile(
         lecture_id=lecture.id,
         file_url=file_path,
@@ -93,6 +103,7 @@ async def upload_file(
     return {
         "file_id": new_file.id,
         "lecture_id": lecture.id,
+        "user_id": user_id,
         "extracted_text": raw_text
     }
 
