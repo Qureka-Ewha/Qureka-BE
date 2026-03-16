@@ -125,11 +125,12 @@ async def update_text(file_id: int, text_content: str = Form(...), db: Session =
 async def confirm_file(file_id: int, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     # 1. 파일 및 관련 사용자 정보 로드
     file_rec = db.query(models.UploadedFile).filter_by(id=file_id).first()
-    if not file_rec: raise HTTPException(status_code=404)
-    
+    if not file_rec:
+        raise HTTPException(status_code=404)
+
     # 이 파일을 소유한 사용자의 정보 가져오기
     user = file_rec.lecture.user 
-    
+
     # 2. 확정 상태 업데이트
     file_rec.is_confirmed = True
     db.commit()
@@ -137,40 +138,36 @@ async def confirm_file(file_id: int, background_tasks: BackgroundTasks, db: Sess
     # 3. 백그라운드 임베딩 작업 시작
     background_tasks.add_task(process_file_chunks, file_id)
 
-    # 4. [핵심] 사용자의 학과/학년 정보를 반영한 첫 질문 생성
-    # 이미 해당 강의에 세션이 있다면 새로 만들지 않음
-    existing_session = db.query(models.ChatSession).filter_by(lecture_id=file_rec.lecture_id).first()
-    
-    if not existing_session:
-        # processing.py의 수정된 함수 호출 (학과, 학년 전달)
-        first_question = processing.generate_initial_question(
-            full_text=file_rec.text_content,
-            dept=user.department,
-            grade=user.grade
-        )
+    # 4. 첫 질문 생성
+    first_question = processing.generate_initial_question(
+        full_text=file_rec.text_content,
+        dept=user.department,
+        grade=user.grade
+    )
 
-        # 대화 세션(ChatSession) 생성
-        new_session = models.ChatSession(
-            lecture_id=file_rec.lecture_id,
-            title=f"{file_rec.lecture.title} - AI 튜터링"
-        )
-        db.add(new_session)
-        db.commit()
-        db.refresh(new_session)
+    # 5. 새 session 생성
+    new_session = models.ChatSession(
+        lecture_id=file_rec.lecture_id,
+        file_id=file_rec.id,
+        title=f"{file_rec.lecture.title} - {os.path.basename(file_rec.file_url)}"
+    )
 
-        # AI의 첫 번째 메시지 저장
-        ai_message = models.ChatMessage(
-            session_id=new_session.id,
-            role="assistant",
-            content=first_question
-        )
-        db.add(ai_message)
-        db.commit()
+    db.add(new_session)
+    db.commit()
+    db.refresh(new_session)
 
-        return {
-            "message": "확정 완료! AI 튜터 Qureka가 첫 질문을 보냈습니다.",
-            "session_id": new_session.id,
-            "first_question": first_question
-        }
+    # 6. 첫 메시지 저장
+    ai_message = models.ChatMessage(
+        session_id=new_session.id,
+        role="assistant",
+        content=first_question
+    )
 
-    return {"message": "확정 완료! 기존 대화 세션에서 계속 학습하세요."}
+    db.add(ai_message)
+    db.commit()
+
+    return {
+        "message": "확정 완료! AI 튜터 Qureka가 첫 질문을 보냈습니다.",
+        "session_id": new_session.id,
+        "first_question": first_question
+    }

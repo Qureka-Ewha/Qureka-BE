@@ -1,5 +1,6 @@
 import os
 from fastapi import FastAPI, Depends, HTTPException
+from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 from sqlalchemy import text  # 확장 설치를 위해 추가
 from dotenv import load_dotenv
@@ -54,13 +55,18 @@ def signup(user: schemas.UserCreate, db: Session = Depends(database.get_db)):
     return {"message": "회원가입 성공"}
 
 @app.post("/login", response_model=schemas.Token, tags=["Auth"])
-def login(form_data: schemas.UserLogin, db: Session = Depends(database.get_db)):
-    user = db.query(models.User).filter(models.User.email == form_data.email).first()
+def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(database.get_db)):
+    user = db.query(models.User).filter(models.User.email == form_data.username).first()
+
     if not user or not auth.verify_password(form_data.password, user.hashed_password):
         raise HTTPException(status_code=401, detail="로그인 정보가 올바르지 않습니다.")
-    
+
     access_token = auth.create_access_token(data={"sub": user.email})
-    return {"access_token": access_token, "token_type": "bearer"}
+
+    return {
+        "access_token": access_token,
+        "token_type": "bearer"
+    }
 
 @app.post("/logout", tags=["Auth"])
 def logout(token: str = Depends(auth.oauth2_scheme)):
@@ -71,5 +77,4 @@ def logout(token: str = Depends(auth.oauth2_scheme)):
 def root():
     return {"status": "running", "message": "Qureka API 통합 서버가 가동 중입니다."}
 
-app.include_router(upload.router, prefix="/files", tags=["Lecture Files"])
 app.include_router(chat.router, prefix="/chat", tags=["Tutoring Chat"])

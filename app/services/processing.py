@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Gemini 설정 (SDK 1.0.0+ 기준)
-client = genai.Client(api_key = os.getenv("GEMINI_API_KEY"), http_options={"api_version": "v1"})
+client = genai.Client(api_key = os.getenv("GEMINI_API_KEY"))
 STT_MODEL = whisper.load_model("turbo")
 
 # -------------------------------------------------

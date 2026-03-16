@@ -42,7 +42,8 @@ class UploadedFile(Base):
 
     lecture = relationship("Lecture", back_populates="files")
     chunks = relationship("LectureChunk", back_populates="file", cascade="all, delete-orphan")
-
+    chat_sessions = relationship("ChatSession", cascade="all, delete-orphan")
+    
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -66,8 +67,10 @@ class LectureChunk(Base):
 
 class ChatSession(Base):
     __tablename__ = "chat_sessions"
+
     id = Column(Integer, primary_key=True)
     lecture_id = Column(Integer, ForeignKey("lectures.id", ondelete="CASCADE"))
+    file_id = Column(Integer, ForeignKey("uploaded_files.id", ondelete="CASCADE"))
     title = Column(String, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
 
