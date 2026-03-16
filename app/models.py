@@ -43,7 +43,7 @@ class UploadedFile(Base):
     lecture = relationship("Lecture", back_populates="files")
     chunks = relationship("LectureChunk", back_populates="file", cascade="all, delete-orphan")
     chat_sessions = relationship("ChatSession", cascade="all, delete-orphan")
-    
+
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -56,7 +56,7 @@ class LectureChunk(Base):
 
     content = Column(Text, nullable=False)
     # 1536차원은 Gemini text-embedding-004 모델의 표준 규격입니다.
-    embedding = Column(Vector(1536)) 
+    embedding = Column(Vector(3072)) 
 
     page_number = Column(Integer, nullable=True)
 

@@ -210,13 +210,13 @@ def get_embeddings(text_list: List[str]):
     if not text_list: return []
     try:
         result = client.models.embed_content(
-            model="text-embedding-004",
+            model="gemini-embedding-001",
             contents=text_list
         )
         return [item.values for item in result.embeddings]
     except Exception as e:
         print(f"❌ 임베딩 실패: {e}")
-        return [[random.uniform(-1, 1) for _ in range(1536)] for _ in text_list]
+        return [[random.uniform(-1, 1) for _ in range(3072)] for _ in text_list]
 
 def transcribe_audio(audio_path: str):
     print(f"--- 음성 인식 시작: {audio_path} ---")
