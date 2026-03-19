@@ -2,114 +2,77 @@ from collections import Counter
 import re
 
 
-# ---------------------------------------
-# 조사 제거
-# ---------------------------------------
-def clean_word(word: str):
-    suffixes = ["은", "는", "이", "가", "을", "를", "에", "의", "와", "과"]
-
-    for suffix in suffixes:
-        if word.endswith(suffix) and len(word) > 1:
-            return word[:-1]
-
-    return word
+# 너무 흔한 단어 제거
+STOPWORDS = {
+    "그리고", "하지만", "그러면", "이건", "그건", "있다", "없다",
+    "하는", "이다", "입니다", "잘", "너무", "좀", "그", "저", "것",
+    "에서", "으로", "하는데", "모르겠어", "설명", "차이", "통해"
+}
 
 
-# ---------------------------------------
-# 개념 단어 추출
-# ---------------------------------------
-def extract_concepts(messages):
-    concepts = []
-
-    stopwords = {
-        "왜", "어떻게", "무엇", "이게", "그럼", "근데", "그리고",
-        "제가", "저는", "그건", "이건"
-    }
+def extract_keywords(messages):
+    words = []
 
     for msg in messages:
+        tokens = re.findall(r"[가-힣A-Za-z]+", msg)
 
-        words = re.findall(r"[가-힣A-Za-z]+", msg)
+        for token in tokens:
+            if len(token) >= 2 and token not in STOPWORDS:
+                words.append(token)
 
-        for word in words:
-
-            word = clean_word(word)
-
-            if len(word) >= 2 and word not in stopwords:
-                concepts.append(word)
-
-    return Counter(concepts)
+    return words
 
 
-# ---------------------------------------
-# 사고 흐름 타임라인 생성
-# ---------------------------------------
+def build_tree(messages, concept_freq):
+    if not concept_freq:
+        return {}
+
+    # 가장 많이 등장한 핵심 개념 1개 선택
+    main_concept = concept_freq.most_common(1)[0][0]
+
+    # 상위 관련 개념 5개 추출 (main 제외)
+    related = [
+        word for word, count in concept_freq.most_common(6)
+        if word != main_concept
+    ]
+
+    return {
+        main_concept: related[:5]
+    }
+
+
 def build_timeline(messages):
-
     timeline = []
 
     for i, msg in enumerate(messages):
-
         if i == 0:
-            timeline.append({
-                "step": msg,
-                "type": "start"
-            })
-
-        elif "모르" in msg or "헷갈" in msg:
-            timeline.append({
-                "step": msg,
-                "type": "confusion"
-            })
-
-        elif "아" in msg or "이해" in msg:
-            timeline.append({
-                "step": msg,
-                "type": "understood"
-            })
-
+            state = "start"
+        elif any(word in msg for word in ["모르겠", "헷갈", "이해 안", "어려워"]):
+            state = "confusion"
+        elif any(word in msg for word in ["알겠", "이해", "오케이"]):
+            state = "understanding"
         else:
-            timeline.append({
-                "step": msg,
-                "type": "progress"
-            })
+            state = "progress"
+
+        timeline.append({
+            "step": msg,
+            "type": state
+        })
 
     return timeline
 
 
-# ---------------------------------------
-# 간단한 트리 구조 생성
-# ---------------------------------------
-def build_tree(messages):
-
-    if not messages:
-        return {}
-
-    root = clean_word(messages[0].split()[0])
-
-    tree = {root: []}
-
-    for msg in messages[1:]:
-
-        concept = clean_word(msg.split()[0])
-
-        tree[root].append(concept)
-
-    return tree
-
-
-# ---------------------------------------
-# 최종 리포트 생성
-# ---------------------------------------
 def generate_learning_report(messages):
+    words = extract_keywords(messages)
 
-    concept_freq = extract_concepts(messages)
+    concept_freq = Counter(words)
 
-    tree = build_tree(messages)
+    tree = build_tree(messages, concept_freq)
 
     timeline = build_timeline(messages)
 
     return {
-        "concept_frequency": concept_freq,
+        "concept_frequency": dict(concept_freq),
         "tree": tree,
         "timeline": timeline
     }
