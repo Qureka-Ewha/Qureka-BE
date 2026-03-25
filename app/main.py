@@ -1,6 +1,7 @@
 import os
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.security import OAuth2PasswordRequestForm
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from dotenv import load_dotenv
@@ -13,6 +14,15 @@ from .routes import upload, chat, report   # report 추가
 load_dotenv()
 
 app = FastAPI(title="Qureka Unified Server")
+
+# 🌟 프론트엔드(React)의 접근을 허락하는 CORS 설정 추가! XXX삭제 금지XXX
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # 모든 주소의 접근을 허용
+    allow_credentials=True,
+    allow_methods=["*"],  # OPTIONS, POST, GET 등 모든 통신 방식 허용
+    allow_headers=["*"],
+)
 
 # 2. 서버 실행 시 DB 준비 (확장 설치 및 테이블 생성)
 @app.on_event("startup")
@@ -84,7 +94,7 @@ def login(
         )
 
     access_token = auth.create_access_token(
-        data={"sub": user.email}
+        data={"sub": user.email, "user_id": user.id} # 토큰에 유저 아이디 추가
     )
 
     return {
