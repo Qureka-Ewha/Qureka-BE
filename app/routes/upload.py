@@ -139,8 +139,10 @@ async def confirm_file(file_id: int, background_tasks: BackgroundTasks, db: Sess
     background_tasks.add_task(process_file_chunks, file_id)
 
     # 4. 첫 질문 생성
+    lecture_pages = [(file_rec.text_content, 1)]
+
     first_question = processing.generate_initial_question(
-        full_text=file_rec.text_content,
+        lecture_pages=lecture_pages,
         dept=user.department,
         grade=user.grade
     )
