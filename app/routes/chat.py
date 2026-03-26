@@ -7,6 +7,10 @@ from ..services import processing
 
 router = APIRouter()
 
+
+# ---------------------------------------------------------
+# 1️⃣ AI 튜터와 대화하기
+# ---------------------------------------------------------
 @router.post("/talk/{session_id}")
 async def talk_to_qureka(
     session_id: int,
@@ -14,40 +18,61 @@ async def talk_to_qureka(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(auth.get_current_user)
 ):
-    # 1. 세션 존재 여부 및 권한 확인
-    session = db.query(models.ChatSession).filter(models.ChatSession.id == session_id).first()
+    # 1. 세션 존재 여부 확인
+    session = db.query(models.ChatSession).filter(
+        models.ChatSession.id == session_id
+    ).first()
+
     if not session:
-        raise HTTPException(status_code=404, detail="대화 세션을 찾을 수 없습니다.")
-    
-    # 2. 유저 메시지 저장
-    new_user_msg = models.ChatMessage(session_id=session.id, role="user", content=user_message)
+        raise HTTPException(
+            status_code=404,
+            detail="대화 세션을 찾을 수 없습니다."
+        )
+
+    # 2. 본인 강의 세션인지 확인
+    if session.lecture.user_id != current_user.id:
+        raise HTTPException(
+            status_code=403,
+            detail="접근 권한이 없습니다."
+        )
+
+    # 3. 유저 메시지 저장
+    new_user_msg = models.ChatMessage(
+        session_id=session.id,
+        role="user",
+        content=user_message
+    )
     db.add(new_user_msg)
     db.commit()
 
-    # 3. RAG: 질문과 가장 관련 있는 강의 조각 찾기
-    # 사용자 답변을 벡터로 변환
+    # 4. 질문 임베딩 생성
     query_vector = processing.get_embeddings([user_message])[0]
-    
-    # DB에서 가장 유사한 강의 조각 3개를 찾습니다.
+
+    # 5. 관련 chunk 검색
     relevant_chunks = db.scalars(
         select(models.LectureChunk)
         .filter(models.LectureChunk.lecture_id == session.lecture_id)
-        .order_by(models.LectureChunk.embedding.l2_distance(query_vector)) # 벡터 거리순 정렬
+        .order_by(models.LectureChunk.embedding.l2_distance(query_vector))
         .limit(3)
     ).all()
-    
-    # 찾은 내용을 하나의 텍스트로 합칩니다.
-    context_text = "\n\n".join([f"[슬라이드 {c.page_number}]: {c.content}" for c in relevant_chunks])
 
-    # 4. 이전 대화 기록(History) 가져오기 (최근 5개 정도)
+    # 6. context 생성
+    context_text = "\n\n".join(
+        [f"[슬라이드 {c.page_number}]: {c.content}" for c in relevant_chunks]
+    )
+
+    # 7. 최근 대화 기록
     history_msgs = db.query(models.ChatMessage).filter(
         models.ChatMessage.session_id == session_id
     ).order_by(models.ChatMessage.id.desc()).limit(6).all()
-    
-    history_msgs.reverse()
-    chat_history_str = "\n".join([f"{m.role}: {m.content}" for m in history_msgs])
 
-    # 5. Qureka 응답 생성 (학과/학년 정보 주입)
+    history_msgs.reverse()
+
+    chat_history_str = "\n".join(
+        [f"{m.role}: {m.content}" for m in history_msgs]
+    )
+
+    # 8. AI 응답 생성
     ai_reply = processing.generate_chat_response(
         context_text=context_text,
         chat_history=chat_history_str,
@@ -55,12 +80,84 @@ async def talk_to_qureka(
         grade=current_user.grade
     )
 
-    # 6. AI 메시지 저장
-    new_ai_msg = models.ChatMessage(session_id=session.id, role="assistant", content=ai_reply)
+    # 9. AI 메시지 저장
+    new_ai_msg = models.ChatMessage(
+        session_id=session.id,
+        role="assistant",
+        content=ai_reply
+    )
+
     db.add(new_ai_msg)
     db.commit()
 
     return {
         "ai_reply": ai_reply,
-        "source_pages": list(set([c.page_number for c in relevant_chunks if c.page_number]))
+        "source_pages": list(
+            set([c.page_number for c in relevant_chunks if c.page_number])
+        )
     }
+
+
+# ---------------------------------------------------------
+# 2️⃣ 대화 세션 목록 조회
+# ---------------------------------------------------------
+@router.get("/sessions")
+def get_chat_sessions(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user)
+):
+    sessions = db.query(models.ChatSession).join(models.Lecture).filter(
+        models.Lecture.user_id == current_user.id
+    ).order_by(models.ChatSession.created_at.desc()).all()
+
+    return [
+        {
+            "session_id": s.id,
+            "title": s.title,
+            "lecture_id": s.lecture_id,
+            "created_at": s.created_at
+        }
+        for s in sessions
+    ]
+
+
+# ---------------------------------------------------------
+# 3️⃣ 특정 세션 대화 내역 조회
+# ---------------------------------------------------------
+@router.get("/history/{session_id}")
+def get_chat_history(
+    session_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user)
+):
+    # 세션 확인
+    session = db.query(models.ChatSession).filter(
+        models.ChatSession.id == session_id
+    ).first()
+
+    if not session:
+        raise HTTPException(
+            status_code=404,
+            detail="세션을 찾을 수 없습니다."
+        )
+
+    # 본인 세션인지 확인
+    if session.lecture.user_id != current_user.id:
+        raise HTTPException(
+            status_code=403,
+            detail="접근 권한이 없습니다."
+        )
+
+    # 메시지 조회
+    messages = db.query(models.ChatMessage).filter(
+        models.ChatMessage.session_id == session_id
+    ).order_by(models.ChatMessage.created_at.asc()).all()
+
+    return [
+        {
+            "role": m.role,
+            "content": m.content,
+            "created_at": m.created_at
+        }
+        for m in messages
+    ]
