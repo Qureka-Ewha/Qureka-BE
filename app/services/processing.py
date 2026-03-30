@@ -10,6 +10,7 @@ from typing import List, Tuple
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
+from concurrent.futures import ThreadPoolExecutor
 
 load_dotenv()
 
@@ -42,24 +43,29 @@ def ocr_with_gemini(page) -> str:
     return response.text
 
 
+def process_single_page(args):
+    page_num, page = args
+
+    print(f"🔥 {page_num}페이지 Gemini 분석 중...")
+
+    try:
+        text = ocr_with_gemini(page)
+        print(f"✅ {page_num}페이지 완료")
+    except Exception as e:
+        print(f"❌ {page_num}페이지 실패: {e}")
+        text = f"에러 발생: {e}"
+
+    return (text, page_num)
+
+
 def extract_from_pdf(file_bytes: bytes) -> List[Tuple[str, int]]:
     doc = fitz.open(stream=file_bytes, filetype="pdf")
-    pages_data = []
 
-    for page_num, page in enumerate(doc, start=1):
-        print(f"🔥 {page_num}페이지: 텍스트 레이어 무시, 오직 이미지로만 분석 중 (10초 대기)...")
-        time.sleep(10)
-        
-        try:
-            text = ocr_with_gemini(page)
-            print(f"--- {page_num}페이지 Gemini 추출 성공 ---")
-        except Exception as e:
-            print(f"❌ API 에러 발생: {e}")
-            text = f"에러 발생으로 분석 실패: {e}"
-        
-        if text:
-            pages_data.append((text, page_num))
-            
+    pages = [(page_num, page) for page_num, page in enumerate(doc, start=1)]
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        pages_data = list(executor.map(process_single_page, pages))
+
     return pages_data
 
 

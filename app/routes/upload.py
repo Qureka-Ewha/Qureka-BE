@@ -4,6 +4,7 @@ from ..database import get_db, SessionLocal
 from .. import models
 from ..services import processing
 import shutil, os
+import json
 
 router = APIRouter()
 
@@ -23,8 +24,12 @@ def process_file_chunks(file_id: int):
 
         # PDF일 경우 시각적 분석 기반으로 재추출하여 페이지 정보 확보
         if file_rec.file_url.lower().endswith(".pdf"):
-            with open(file_rec.file_url, "rb") as f:
-                pages_data = processing.extract_from_pdf(f.read())
+            pages_json = json.loads(file_rec.page_text)
+
+            pages_data = [
+                (item["text"], item["page"])
+                for item in pages_json
+            ]
             chunks_with_page = processing.chunk_text_with_page(pages_data)
         else:
             chunks_with_page = [(file_rec.text_content, 1)]
@@ -69,8 +74,13 @@ async def upload_file(
         with open(file_path, "rb") as f:
             pages_data = processing.extract_from_pdf(f.read())
             raw_text = "\n".join([p[0] for p in pages_data])
+            page_text_json = json.dumps([
+                {"page": p[1], "text": p[0]}
+                for p in pages_data
+            ], ensure_ascii=False)
     elif file.filename.lower().endswith((".mp3", ".wav", ".m4a")):
         raw_text = processing.transcribe_audio(file_path)
+        page_text_json = None
     else:
         raise HTTPException(status_code=400, detail="지원하지 않는 파일 형식입니다.")
 
@@ -94,8 +104,10 @@ async def upload_file(
         file_url=file_path,
         file_type=file.content_type,
         text_content=raw_text,
+        page_text=page_text_json,
         is_confirmed=False
     )
+    
     db.add(new_file)
     db.commit()
     db.refresh(new_file)
@@ -139,7 +151,14 @@ async def confirm_file(file_id: int, background_tasks: BackgroundTasks, db: Sess
     background_tasks.add_task(process_file_chunks, file_id)
 
     # 4. 첫 질문 생성
-    lecture_pages = [(file_rec.text_content, 1)]
+    if file_rec.page_text:
+        pages_json = json.loads(file_rec.page_text)
+        lecture_pages = [
+            (item["text"], item["page"])
+            for item in pages_json
+        ]
+    else:
+        lecture_pages = [(file_rec.text_content, 1)]
 
     first_question = processing.generate_initial_question(
         lecture_pages=lecture_pages,

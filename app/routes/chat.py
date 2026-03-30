@@ -72,9 +72,15 @@ async def talk_to_qureka(
         [f"{m.role}: {m.content}" for m in history_msgs]
     )
 
+    # 전체 텍스트를 chunk로 분할
+    lecture_pages = processing.chunk_text_with_page([(context_text, 1)])
+
+    # 핵심 chunk 선택
+    selected_context = processing.select_key_chunks(lecture_pages)
+
     # 8. AI 응답 생성
     ai_reply = processing.generate_chat_response(
-        context_text=context_text,
+        context_text=selected_context,
         chat_history=chat_history_str,
         dept=current_user.department,
         grade=current_user.grade
@@ -161,3 +167,56 @@ def get_chat_history(
         }
         for m in messages
     ]
+
+# ---------------------------------------------------------
+# 4️⃣ 세션 제목 수정
+# ---------------------------------------------------------
+@router.patch("/sessions/{session_id}")
+def update_session_title(
+    session_id: int,
+    title: str = Form(...),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user)
+):
+    session = db.query(models.ChatSession).filter(
+        models.ChatSession.id == session_id
+    ).first()
+
+    if not session:
+        raise HTTPException(status_code=404, detail="세션 없음")
+
+    if session.lecture.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="권한 없음")
+
+    session.title = title
+    db.commit()
+
+    return {"message": "제목 수정 완료"}
+
+# ---------------------------------------------------------
+# 5️⃣ 세션 삭제
+# ---------------------------------------------------------
+@router.delete("/sessions/{session_id}")
+def delete_session(
+    session_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user)
+):
+    session = db.query(models.ChatSession).filter(
+        models.ChatSession.id == session_id
+    ).first()
+
+    if not session:
+        raise HTTPException(status_code=404, detail="세션 없음")
+
+    if session.lecture.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="권한 없음")
+
+    db.query(models.ChatMessage).filter(
+        models.ChatMessage.session_id == session_id
+    ).delete()
+
+    db.delete(session)
+    db.commit()
+
+    return {"message": "삭제 완료"}

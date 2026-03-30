@@ -38,6 +38,7 @@ class UploadedFile(Base):
     file_url = Column(String, nullable=False)
     file_type = Column(String, nullable=False)
     text_content = Column(Text, nullable=True) 
+    page_text = Column(Text, nullable=True)
     is_confirmed = Column(Boolean, default=False)
 
     lecture = relationship("Lecture", back_populates="files")
@@ -55,7 +56,7 @@ class LectureChunk(Base):
     file_id = Column(Integer, ForeignKey("uploaded_files.id", ondelete="CASCADE"))
 
     content = Column(Text, nullable=False)
-    # 1536차원은 Gemini text-embedding-004 모델의 표준 규격입니다.
+  
     embedding = Column(Vector(3072)) 
 
     page_number = Column(Integer, nullable=True)
