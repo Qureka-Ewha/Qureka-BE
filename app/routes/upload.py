@@ -4,7 +4,6 @@ from ..database import get_db, SessionLocal
 from .. import models
 from ..services import processing
 import shutil, os
-import json
 
 router = APIRouter()
 
@@ -24,12 +23,8 @@ def process_file_chunks(file_id: int):
 
         # PDF일 경우 시각적 분석 기반으로 재추출하여 페이지 정보 확보
         if file_rec.file_url.lower().endswith(".pdf"):
-            pages_json = json.loads(file_rec.page_text)
-
-            pages_data = [
-                (item["text"], item["page"])
-                for item in pages_json
-            ]
+            with open(file_rec.file_url, "rb") as f:
+                pages_data = processing.extract_from_pdf(f.read())
             chunks_with_page = processing.chunk_text_with_page(pages_data)
         else:
             chunks_with_page = [(file_rec.text_content, 1)]
@@ -74,13 +69,8 @@ async def upload_file(
         with open(file_path, "rb") as f:
             pages_data = processing.extract_from_pdf(f.read())
             raw_text = "\n".join([p[0] for p in pages_data])
-            page_text_json = json.dumps([
-                {"page": p[1], "text": p[0]}
-                for p in pages_data
-            ], ensure_ascii=False)
     elif file.filename.lower().endswith((".mp3", ".wav", ".m4a")):
         raw_text = processing.transcribe_audio(file_path)
-        page_text_json = None
     else:
         raise HTTPException(status_code=400, detail="지원하지 않는 파일 형식입니다.")
 
@@ -104,10 +94,8 @@ async def upload_file(
         file_url=file_path,
         file_type=file.content_type,
         text_content=raw_text,
-        page_text=page_text_json,
         is_confirmed=False
     )
-    
     db.add(new_file)
     db.commit()
     db.refresh(new_file)
@@ -135,13 +123,13 @@ async def update_text(file_id: int, text_content: str = Form(...), db: Session =
 # ---------------------------------------------------------
 @router.post("/confirm/{file_id}")
 async def confirm_file(file_id: int, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
-    # 1. 파일 및 관련 사용자 정보 로드
+    # 1. 파일 및 관련 정보 로드
     file_rec = db.query(models.UploadedFile).filter_by(id=file_id).first()
     if not file_rec:
-        raise HTTPException(status_code=404)
+        raise HTTPException(status_code=404, detail="파일을 찾을 수 없습니다.")
 
-    # 이 파일을 소유한 사용자의 정보 가져오기
     user = file_rec.lecture.user 
+    lecture_title = file_rec.lecture.title # 강의 제목 확보
 
     # 2. 확정 상태 업데이트
     file_rec.is_confirmed = True
@@ -150,40 +138,38 @@ async def confirm_file(file_id: int, background_tasks: BackgroundTasks, db: Sess
     # 3. 백그라운드 임베딩 작업 시작
     background_tasks.add_task(process_file_chunks, file_id)
 
-    # 4. 첫 질문 생성
+    # 4. 첫 질문 생성을 위한 페이지 데이터 구성
+    # (추출된 페이지 정보가 있으면 활용하고, 없으면 전체 텍스트를 1페이지로 처리)
     if file_rec.page_text:
         pages_json = json.loads(file_rec.page_text)
-        lecture_pages = [
-            (item["text"], item["page"])
-            for item in pages_json
-        ]
+        lecture_pages = [(item["text"], item["page"]) for item in pages_json]
     else:
         lecture_pages = [(file_rec.text_content, 1)]
 
+    # 5. AI 첫 질문 생성 (강의명 포함)
     first_question = processing.generate_initial_question(
         lecture_pages=lecture_pages,
         dept=user.department,
-        grade=user.grade
+        grade=user.grade,
+        lecture_title=lecture_title
     )
 
-    # 5. 새 session 생성
+    # 6. 새 대화 세션 생성
     new_session = models.ChatSession(
         lecture_id=file_rec.lecture_id,
         file_id=file_rec.id,
-        title=f"{file_rec.lecture.title} - {os.path.basename(file_rec.file_url)}"
+        title=f"{lecture_title} - {os.path.basename(file_rec.file_url)}"
     )
-
     db.add(new_session)
     db.commit()
     db.refresh(new_session)
 
-    # 6. 첫 메시지 저장
+    # 7. 첫 AI 메시지 저장
     ai_message = models.ChatMessage(
         session_id=new_session.id,
         role="assistant",
         content=first_question
     )
-
     db.add(ai_message)
     db.commit()
 
