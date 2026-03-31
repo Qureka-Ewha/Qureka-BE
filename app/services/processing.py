@@ -190,10 +190,10 @@ def select_key_chunks(lecture_pages, max_pages=3):
 
     return result
 
-def generate_initial_question(lecture_pages, dept: str, grade: int) -> str:
+def generate_initial_question(lecture_pages, dept: str, grade: int, lecture_title: str) -> str:
     """강의 자료 확정 시 사용자의 학과/학년에 맞춘 첫 번째 질문 생성"""
     selected_text = select_key_chunks(lecture_pages)
-    system_prompt = get_qureka_system_prompt(dept, grade)
+    system_prompt = get_qureka_system_prompt(dept, grade, lecture_title)
     prompt = f"""
     {system_prompt}
     
@@ -215,9 +215,9 @@ def generate_initial_question(lecture_pages, dept: str, grade: int) -> str:
         return "강의 자료를 분석했습니다. 이 자료에서 다루는 가장 핵심적인 개념은 무엇이라고 생각하시나요?"
 
 
-def generate_chat_response(context_text: str, chat_history: str, dept: str, grade: int) -> str:
+def generate_chat_response(context_text: str, chat_history: str, dept: str, grade: int, lecture_title: str) -> str:
     """학생의 답변에 따른 소크라테스식 꼬리 질문 생성"""
-    system_prompt = get_qureka_system_prompt(dept, grade)
+    system_prompt = get_qureka_system_prompt(dept, grade, lecture_title)
     prompt = f"""
     {system_prompt}
     
