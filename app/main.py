@@ -94,7 +94,7 @@ def login(
         )
 
     access_token = auth.create_access_token(
-        data={"sub": user.email, "user_id": user.id} # 토큰에 유저 아이디 추가
+        data={"sub": user.email, "user_id": user.id, "name": user.nickname} # 토큰에 유저 아이디, 이름(닉네임) 추가
     )
 
     return {
