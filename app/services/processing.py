@@ -10,7 +10,6 @@ from typing import List, Tuple
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
-from concurrent.futures import ThreadPoolExecutor
 
 load_dotenv()
 
@@ -43,29 +42,24 @@ def ocr_with_gemini(page) -> str:
     return response.text
 
 
-def process_single_page(args):
-    page_num, page = args
-
-    print(f"🔥 {page_num}페이지 Gemini 분석 중...")
-
-    try:
-        text = ocr_with_gemini(page)
-        print(f"✅ {page_num}페이지 완료")
-    except Exception as e:
-        print(f"❌ {page_num}페이지 실패: {e}")
-        text = f"에러 발생: {e}"
-
-    return (text, page_num)
-
-
 def extract_from_pdf(file_bytes: bytes) -> List[Tuple[str, int]]:
     doc = fitz.open(stream=file_bytes, filetype="pdf")
+    pages_data = []
 
-    pages = [(page_num, page) for page_num, page in enumerate(doc, start=1)]
-
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        pages_data = list(executor.map(process_single_page, pages))
-
+    for page_num, page in enumerate(doc, start=1):
+        print(f"🔥 {page_num}페이지: 텍스트 레이어 무시, 오직 이미지로만 분석 중 (10초 대기)...")
+        time.sleep(10)
+        
+        try:
+            text = ocr_with_gemini(page)
+            print(f"--- {page_num}페이지 Gemini 추출 성공 ---")
+        except Exception as e:
+            print(f"❌ API 에러 발생: {e}")
+            text = f"에러 발생으로 분석 실패: {e}"
+        
+        if text:
+            pages_data.append((text, page_num))
+            
     return pages_data
 
 
@@ -73,19 +67,20 @@ def extract_from_pdf(file_bytes: bytes) -> List[Tuple[str, int]]:
 # 2. 소크라테스식 AI 튜터 'Qureka' 핵심 로직
 # -------------------------------------------------
 
-def get_qureka_system_prompt(dept: str, grade: int) -> str:
-    """사용자의 학과와 학년 정보를 반영한 시스템 프롬프트 생성"""
+def get_qureka_system_prompt(dept: str, grade: int, lecture_title: str) -> str:
+    """사용자의 학과와 학년 정보, 강의명을 반영한 시스템 프롬프트 생성"""
     return f"""
 시스템 프롬프트: 소크라테스식 AI 튜터 'Qureka'
 
 1. Role & Context (역할 및 맥락)
 - 당신은 누구인가: 자기주도 학습을 돕는 AI 튜터 'Qureka'입니다.
+- 현재 학습 중인 과목: [{lecture_title}]
 - 사용자: 당신 앞에 있는 학생은 [{dept}] 학과 [{grade}]학년 전공자입니다. 학생의 수준에 맞는 전문적인 용어와 논리를 사용하세요.
 - 목표: 사용자가 업로드한 [강의 자료]를 분석하여, 단순 요약이 아닌 소크라테스식 문답법을 통해 학생이 스스로 개념을 깨우치고 사고를 확장하도록 돕는 것입니다.
 
 2. Prime Directives (핵심 지시사항)
 A. 엄격한 자료 기반성 (Strict Grounding)
-- 모든 질문과 피드백은 반드시 제공된 [강의 자료]의 내용과 팩트에 근거해야 합니다.
+- 모든 질문과 피드백은 반드시 제공된 [강의 자료]의 내용과 팩트 그리고 [{lecture_title}] 과목의 맥락에 근거해야 합니다.
 - 질문·피드백 시 가능하면 슬라이드 번호 또는 용어를 명시적으로 활용하세요.
 - 가능하면 질문 속 핵심 용어를 강의 자료의 원문 표현 그대로 유지하세요.
 - 강의 자료 범위를 벗어난 질문에는 "해당 내용은 강의 자료에서 확인할 수 없습니다."라고 밝히고, 자료 내의 연관된 주제로 대화를 이끄세요.
@@ -195,10 +190,10 @@ def select_key_chunks(lecture_pages, max_pages=3):
 
     return result
 
-def generate_initial_question(lecture_pages, dept: str, grade: int) -> str:
+def generate_initial_question(lecture_pages, dept: str, grade: int, lecture_title: str) -> str:
     """강의 자료 확정 시 사용자의 학과/학년에 맞춘 첫 번째 질문 생성"""
     selected_text = select_key_chunks(lecture_pages)
-    system_prompt = get_qureka_system_prompt(dept, grade)
+    system_prompt = get_qureka_system_prompt(dept, grade, lecture_title)
     prompt = f"""
     {system_prompt}
     
@@ -220,9 +215,9 @@ def generate_initial_question(lecture_pages, dept: str, grade: int) -> str:
         return "강의 자료를 분석했습니다. 이 자료에서 다루는 가장 핵심적인 개념은 무엇이라고 생각하시나요?"
 
 
-def generate_chat_response(context_text: str, chat_history: str, dept: str, grade: int) -> str:
+def generate_chat_response(context_text: str, chat_history: str, dept: str, grade: int, lecture_title: str) -> str:
     """학생의 답변에 따른 소크라테스식 꼬리 질문 생성"""
-    system_prompt = get_qureka_system_prompt(dept, grade)
+    system_prompt = get_qureka_system_prompt(dept, grade, lecture_title)
     prompt = f"""
     {system_prompt}
     
