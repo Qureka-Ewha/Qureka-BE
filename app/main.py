@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 
 # 내부 모듈 임포트
 from . import models, schemas, auth, database
-from .routes import upload, chat, report   # report 추가
+from .routes import upload, chat, report, users   # report, users 추가
 
 # 1. 환경 설정 로드
 load_dotenv()
@@ -47,6 +47,7 @@ token_blacklist = set()
 app.include_router(upload.router, prefix="/files", tags=["Lecture Files"])
 app.include_router(chat.router, prefix="/chat", tags=["Tutoring Chat"])
 app.include_router(report.router, prefix="/analysis", tags=["Learning Report"])   # 추가
+app.include_router(users.router, prefix="/users", tags=["Users"]) # Users(마이페이지) 추가!
 
 
 # --- 인증 관련 API ---
