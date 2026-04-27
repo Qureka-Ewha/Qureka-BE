@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Form
 from sqlalchemy.orm import Session
 from sqlalchemy import select
 from ..database import get_db
-from .. import models, auth
+from .. import models, auth, database
 from ..services import processing
 
 router = APIRouter()
@@ -166,3 +166,26 @@ def get_chat_history(
         }
         for m in messages
     ]
+
+# 🌟 대화방 이름 수정 API
+@router.patch("/sessions/{session_id}")
+def update_session_title(
+    session_id: int, # models.py에서 id가 Integer이므로 int로 받습니다.
+    title: str = Form(...),
+    db: Session = Depends(database.get_db),
+    current_user: models.User = Depends(auth.get_current_user)
+):
+    # 1. DB에서 해당 세션(대화방) 찾기 (id만으로 검색!)
+    session = db.query(models.ChatSession).filter(
+        models.ChatSession.id == session_id
+    ).first()
+
+    # 2. 방이 없으면 에러 튕겨내기
+    if not session:
+        raise HTTPException(status_code=404, detail="대화방을 찾을 수 없습니다.")
+
+    # 3. 프론트에서 넘어온 새 이름(title)으로 변경 후 DB에 저장
+    session.title = title
+    db.commit()
+
+    return {"message": "대화방 이름이 성공적으로 변경되었습니다.", "title": title}
