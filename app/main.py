@@ -116,3 +116,4 @@ def root():
         "status": "running",
         "message": "Qureka API 통합 서버가 가동 중입니다."
     }
+
