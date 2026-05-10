@@ -1,3 +1,5 @@
+from typing import Optional
+
 from fastapi import APIRouter, Depends, HTTPException, Form
 from sqlalchemy.orm import Session
 from .. import models, auth, database
@@ -21,17 +23,13 @@ def get_my_info(current_user: models.User = Depends(auth.get_current_user)):
 # ---------------------------------------------------------
 @router.patch("/me")
 def update_my_info(
-    # 🌟 필수로 받아야 하는 현재 비밀번호! (없으면 에러 남)
-    current_password: str = Form(...), 
-    
-    # 선택적으로 받는 수정할 정보들
-    new_nickname: str = Form(None), 
-    new_department: str = Form(None),
-    new_grade: str = Form(None),
-    new_password: str = Form(None), 
-    
-    db: Session = Depends(database.get_db), 
-    current_user: models.User = Depends(auth.get_current_user)
+    current_password: str = Form(...),
+    new_nickname: Optional[str] = Form(default=None),
+    new_department: Optional[str] = Form(default=None),
+    new_grade: Optional[str] = Form(default=None),
+    new_password: Optional[str] = Form(default=None),
+    db: Session = Depends(database.get_db),
+    current_user: models.User = Depends(auth.get_current_user),
 ):
     # 🚨 가장 중요: 현재 비밀번호가 맞는지부터 확인!
     if not auth.verify_password(current_password, current_user.hashed_password):
@@ -42,8 +40,14 @@ def update_my_info(
         current_user.nickname = new_nickname
     if new_department:
         current_user.department = new_department
-    if new_grade:
-        current_user.grade = new_grade
+    if new_grade is not None and str(new_grade).strip():
+        try:
+            current_user.grade = int(new_grade)
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail="학년은 정수 형식으로 보내주세요.",
+            )
     if new_password:
         current_user.hashed_password = auth.get_password_hash(new_password)
     

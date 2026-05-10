@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from ..database import get_db
 from .. import models, auth
@@ -16,9 +16,12 @@ def get_learning_report(
 ):
 
     # 1. 세션 조회
-    session = db.query(models.ChatSession).filter(
-        models.ChatSession.id == session_id
-    ).first()
+    session = (
+        db.query(models.ChatSession)
+        .options(joinedload(models.ChatSession.lecture))
+        .filter(models.ChatSession.id == session_id)
+        .first()
+    )
 
     if not session:
         raise HTTPException(

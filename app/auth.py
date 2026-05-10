@@ -8,10 +8,18 @@ from sqlalchemy.orm import Session
 from . import models, database # DB 및 모델 참조 추가
 import os
 
-# JWT 설정
-SECRET_KEY = "your-secret-key"  # 실제 서비스 시 .env 환경변수로 관리 권장
+# JWT 설정 (.env 에 JWT_SECRET_KEY 설정 권장; 없으면 개발용 기본값)
+SECRET_KEY = os.getenv("JWT_SECRET_KEY", "dev-only-insecure-change-me")
+
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
+# 로그아웃 시 무효화한 액세스 토큰 (재시작 시 초기화; 운영은 Redis 등 검토)
+REVOKED_TOKENS: set[str] = set()
+
+
+def blacklist_token(token: str) -> None:
+    REVOKED_TOKENS.add(token)
 
 # OAuth2 설정 (Swagger UI에서 로그인 버튼 활성화 용도)
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
@@ -50,7 +58,10 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
         detail="인증 정보가 유효하지 않거나 만료되었습니다.",
         headers={"WWW-Authenticate": "Bearer"},
     )
-    
+
+    if token in REVOKED_TOKENS:
+        raise credentials_exception
+
     try:
         # 토큰 복호화
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])

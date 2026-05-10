@@ -1,15 +1,22 @@
 import os
 import json
-import google.generativeai as genai
+from google import genai
 from dotenv import load_dotenv
 from collections import Counter
 import re
 
 load_dotenv()
 
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+_GEMINI_MODEL = "models/gemini-2.5-flash"
 
-model = genai.GenerativeModel("gemini-2.5-flash")
+
+def _generation_text(resp) -> str:
+    try:
+        t = getattr(resp, "text", None)
+        return (t or "").strip()
+    except Exception:
+        return ""
 
 # 너무 흔한 단어 제거
 STOPWORDS = {
@@ -81,10 +88,13 @@ def build_tree_with_gemini(messages, concept_freq):
 }}
 """
 
-    response = model.generate_content(prompt)
+    response = _client.models.generate_content(
+        model=_GEMINI_MODEL,
+        contents=[prompt],
+    )
 
+    cleaned = _generation_text(response).replace("```json", "").replace("```", "")
     try:
-        cleaned = response.text.strip().replace("```json", "").replace("```", "")
         return json.loads(cleaned)
     except Exception:
         return build_tree(messages, concept_freq)
@@ -162,10 +172,13 @@ start, progress, confusion, understanding
 ]
 """
 
-    response = model.generate_content(prompt)
+    response = _client.models.generate_content(
+        model=_GEMINI_MODEL,
+        contents=[prompt],
+    )
 
+    cleaned = _generation_text(response).replace("```json", "").replace("```", "")
     try:
-        cleaned = response.text.strip().replace("```json", "").replace("```", "")
         return json.loads(cleaned)
     except Exception:
         return build_timeline(messages)

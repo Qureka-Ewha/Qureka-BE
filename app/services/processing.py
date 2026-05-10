@@ -1,12 +1,11 @@
-import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import fitz  # PyMuPDF
 import whisper
 import os
 import re
 import io
 import random
-import numpy as np
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
@@ -17,65 +16,120 @@ load_dotenv()
 client = genai.Client(api_key = os.getenv("GEMINI_API_KEY"))
 STT_MODEL = whisper.load_model("turbo")
 
-# -------------------------------------------------
-# 1. 스마트 OCR 엔진 (Vision 분석)
-# -------------------------------------------------
-def ocr_with_gemini(page) -> str:
-    """PDF 텍스트 레이어를 무시하고 이미지를 직접 시각 분석"""
-    pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0)) 
-    img_data = pix.tobytes("png")
-    
-    prompt = """
-    이미지 속의 모든 내용을 텍스트로 변환하세요.
-    특히, 사람이 직접 펜으로 적은 '손글씨 필기'나 '메모', 화살표 옆의 낙서 등을 절대로 빼놓지 마세요.
-    손글씨가 있다면 해당 내용 앞에 반드시 [손글씨] 라고 붙여주세요.
-    예시: [손글씨] 시험에 나옴! 
-    """
-    
+_PDF_MATRIX_SCALE = float(os.getenv("PDF_RENDER_SCALE", "1.75"))
+_NATIVE_TEXT_MIN_CHARS = int(os.getenv("PDF_NATIVE_TEXT_MIN_CHARS", "50"))
+PDF_OCR_MAX_WORKERS = max(1, int(os.getenv("PDF_OCR_MAX_WORKERS", "4")))
+_FORCE_FULL_VISION = os.getenv("PDF_FORCE_FULL_VISION", "").lower() in ("1", "true", "yes")
+
+_GEMINI_SLIDE_PROMPT = """
+이미지 속의 모든 내용을 텍스트로 변환하세요.
+특히, 사람이 직접 펜으로 적은 '손글씨 필기'나 '메모', 화살표 옆의 낙서 등을 절대로 빼놓지 마세요.
+손글씨가 있다면 해당 내용 앞에 반드시 [손글씨] 라고 붙여주세요.
+예시: [손글씨] 시험에 나옴!
+"""
+
+
+def _slide_image_to_png_bytes(page) -> bytes:
+    pix = page.get_pixmap(matrix=fitz.Matrix(_PDF_MATRIX_SCALE, _PDF_MATRIX_SCALE))
+    return pix.tobytes("png")
+
+
+def ocr_with_gemini_png(img_data: bytes) -> str:
+    """슬라이드/페이지 렌더 이미지를 Gemini Vision으로 읽음."""
     response = client.models.generate_content(
-        model="models/gemini-2.5-flash", 
+        model="models/gemini-2.5-flash",
         contents=[
-            types.Part.from_bytes(data=img_data, mime_type='image/png'),
-            prompt
-        ]
+            types.Part.from_bytes(data=img_data, mime_type="image/png"),
+            _GEMINI_SLIDE_PROMPT,
+        ],
     )
-    return response.text
+    text = getattr(response, "text", None)
+    return (text or "").strip()
 
 
 def extract_from_pdf(file_bytes: bytes) -> List[Tuple[str, int]]:
+    """
+    디지털 PDF는 PyMuPDF 텍스트 레이어를 우선 사용(즉시)하고,
+    텍스트가 거의 없는 페이지만 Gemini Vision 처리합니다.
+    Vision 호출은 ThreadPoolExecutor로 병렬화합니다.
+
+    모든 페이지를 무조건 Gemini로 할 때는 환경 변수 PDF_FORCE_FULL_VISION=true
+    병렬 수: PDF_OCR_MAX_WORKERS (기본 4)
+    """
     doc = fitz.open(stream=file_bytes, filetype="pdf")
-    pages_data = []
+    native_pages: List[Tuple[str, int]] = []
+    ocr_jobs: List[Tuple[int, bytes]] = []
+    ocr_fallback: Dict[int, str] = {}
 
     for page_num, page in enumerate(doc, start=1):
-        print(f"🔥 {page_num}페이지: 텍스트 레이어 무시, 오직 이미지로만 분석 중 (10초 대기)...")
-        time.sleep(10)
-        
-        try:
-            text = ocr_with_gemini(page)
-            print(f"--- {page_num}페이지 Gemini 추출 성공 ---")
-        except Exception as e:
-            print(f"❌ API 에러 발생: {e}")
-            text = f"에러 발생으로 분석 실패: {e}"
-        
-        if text:
-            pages_data.append((text, page_num))
-            
-    return pages_data
+        plain = (page.get_text("text") or "").strip()
+
+        need_vision = _FORCE_FULL_VISION or (
+            len(plain) < _NATIVE_TEXT_MIN_CHARS
+        )
+
+        if need_vision:
+            try:
+                ocr_fallback[page_num] = plain
+                ocr_jobs.append((page_num, _slide_image_to_png_bytes(page)))
+            except Exception as e:
+                print(f"⚠ 페이지 {page_num} 렌더 실패: {e}")
+                if plain:
+                    native_pages.append((plain, page_num))
+        elif plain:
+            native_pages.append((plain, page_num))
+
+    doc.close()
+
+    vision_results: List[Tuple[str, int]] = []
+    if ocr_jobs:
+        workers = min(PDF_OCR_MAX_WORKERS, len(ocr_jobs))
+
+        def _run(item: Tuple[int, bytes]) -> Tuple[str, int]:
+            pn, png = item
+            fb = ocr_fallback.get(pn, "")
+            try:
+                txt = (ocr_with_gemini_png(png) or "").strip()
+                print(f"--- {pn}페이지 Gemini 추출 성공 ---")
+                merged = txt or fb
+                return (
+                    merged if merged else "(빈 응답)",
+                    pn,
+                )
+            except Exception as e:
+                print(f"❌ {pn}페이지 API 에러: {e}")
+                return (
+                    fb or f"에러 발생으로 분석 실패: {e}",
+                    pn,
+                )
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_map = {executor.submit(_run, job): job[0] for job in ocr_jobs}
+            for fut in as_completed(future_map):
+                text, pn = fut.result()
+                if text:
+                    vision_results.append((text, pn))
+
+    combined = native_pages + vision_results
+    combined.sort(key=lambda x: x[1])
+    return combined
 
 
 # -------------------------------------------------
 # 2. 소크라테스식 AI 튜터 'Qureka' 핵심 로직
 # -------------------------------------------------
 
-def get_qureka_system_prompt(dept: str, grade: int, lecture_title: str) -> str:
+def get_qureka_system_prompt(dept: str | None, grade: int | None, lecture_title: str) -> str:
     """사용자의 학과와 학년 정보, 강의명을 반영한 시스템 프롬프트 생성"""
+    dept_disp = (dept or "").strip() or "학과 미입력"
+    grade_disp = f"{grade}학년" if grade is not None else "학년 미입력"
     return f"""
 시스템 프롬프트: 소크라테스식 AI 튜터 'Qureka'
 
 1. Role & Context (역할 및 맥락)
 - 당신은 누구인가: 자기주도 학습을 돕는 AI 튜터 'Qureka'입니다.
 - 현재 학습 중인 과목: [{lecture_title}]
-- 사용자: 당신 앞에 있는 학생은 [{dept}] 학과 [{grade}]학년 전공자입니다. 학생의 수준에 맞는 전문적인 용어와 논리를 사용하세요.
+- 사용자: 당신 앞에 있는 학생은 [{dept_disp}] 학과 [{grade_disp}] 전공자입니다. 학생의 수준에 맞는 전문적인 용어와 논리를 사용하세요.
 - 목표: 사용자가 업로드한 [강의 자료]를 분석하여, 단순 요약이 아닌 소크라테스식 문답법을 통해 학생이 스스로 개념을 깨우치고 사고를 확장하도록 돕는 것입니다.
 
 2. Prime Directives (핵심 지시사항)
@@ -197,7 +251,7 @@ def select_key_chunks(lecture_pages, max_pages=3):
 
     return result
 
-def generate_initial_question(lecture_pages, dept: str, grade: int, lecture_title: str) -> str:
+def generate_initial_question(lecture_pages, dept: str | None, grade: int | None, lecture_title: str) -> str:
     """강의 자료 확정 시 사용자의 학과/학년에 맞춘 첫 번째 질문 생성"""
     selected_text = select_key_chunks(lecture_pages)
     system_prompt = get_qureka_system_prompt(dept, grade, lecture_title)
@@ -216,13 +270,23 @@ def generate_initial_question(lecture_pages, dept: str, grade: int, lecture_titl
             model="models/gemini-2.5-flash",
             contents=[prompt]
         )
-        return response.text
+        text = getattr(response, "text", None) or ""
+        text = text.strip()
+        return text or (
+            "강의 자료를 분석했습니다. 이 자료에서 다루는 가장 핵심적인 개념은 무엇이라고 생각하시나요?"
+        )
     except Exception as e:
         print(f"❌ 질문 생성 실패: {e}")
         return "강의 자료를 분석했습니다. 이 자료에서 다루는 가장 핵심적인 개념은 무엇이라고 생각하시나요?"
 
 
-def generate_chat_response(context_text: str, chat_history: str, dept: str, grade: int, lecture_title: str) -> str:
+def generate_chat_response(
+    context_text: str,
+    chat_history: str,
+    dept: str | None,
+    grade: int | None,
+    lecture_title: str,
+) -> str:
     """학생의 답변에 따른 소크라테스식 꼬리 질문 생성"""
     system_prompt = get_qureka_system_prompt(dept, grade, lecture_title)
     prompt = f"""
@@ -246,7 +310,11 @@ def generate_chat_response(context_text: str, chat_history: str, dept: str, grad
             model="models/gemini-2.5-flash",
             contents=[prompt]
         )
-        return response.text
+        text = getattr(response, "text", None) or ""
+        text = text.strip()
+        return text or (
+            "답변을 다시 생각해보면 어떨까요? 왜 그렇게 판단했는지 설명해줄 수 있나요?"
+        )
     except Exception as e:
         print(f"❌ 대화 생성 실패: {e}")
         return "답변을 다시 생각해보면 어떨까요? 왜 그렇게 판단했는지 설명해줄 수 있나요?"

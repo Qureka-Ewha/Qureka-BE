@@ -15,10 +15,25 @@ load_dotenv()
 
 app = FastAPI(title="Qureka Unified Server")
 
-# 🌟 프론트엔드(React)의 접근을 허락하는 CORS 설정 추가! XXX삭제 금지XXX
+# CORS: allow_credentials=True일 때 브라우저는 Allow-Origin: * 를 허용하지 않습니다.
+# (크리덴셜 요청 시 API가 브라우저에서 계속 차단되는 흔한 원인)
+_cors_origins_env = os.getenv("CORS_ORIGINS")
+_default_origins = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+]
+if _cors_origins_env and _cors_origins_env.strip():
+    _allow_origins = [o.strip() for o in _cors_origins_env.split(",") if o.strip()]
+    if not _allow_origins:
+        _allow_origins = list(_default_origins)
+else:
+    _allow_origins = list(_default_origins)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 모든 주소의 접근을 허용
+    allow_origins=_allow_origins,
     allow_credentials=True,
     allow_methods=["*"],  # OPTIONS, POST, GET 등 모든 통신 방식 허용
     allow_headers=["*"],
@@ -39,11 +54,7 @@ def startup_event():
     models.Base.metadata.create_all(bind=database.engine)
 
 
-# 3. 로그아웃을 위한 블랙리스트 저장소
-token_blacklist = set()
-
-
-# 4. 라우터 연결
+# 3. 라우터 연결
 app.include_router(upload.router, prefix="/files", tags=["Lecture Files"])
 app.include_router(chat.router, prefix="/chat", tags=["Tutoring Chat"])
 app.include_router(report.router, prefix="/analysis", tags=["Learning Report"])   # 추가
@@ -106,7 +117,7 @@ def login(
 
 @app.post("/logout", tags=["Auth"])
 def logout(token: str = Depends(auth.oauth2_scheme)):
-    token_blacklist.add(token)
+    auth.blacklist_token(token)
     return {"message": "Successfully logged out"}
 
 

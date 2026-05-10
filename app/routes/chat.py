@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, Form
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import select
 from ..database import get_db
 from .. import models, auth, database
@@ -18,10 +18,13 @@ async def talk_to_qureka(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(auth.get_current_user)
 ):
-    # 1. 세션 존재 여부 확인
-    session = db.query(models.ChatSession).filter(
-        models.ChatSession.id == session_id
-    ).first()
+    # 1. 세션 존재 여부 확인 (lecture는 권한·제목 조회 시 즉시 로드)
+    session = (
+        db.query(models.ChatSession)
+        .options(joinedload(models.ChatSession.lecture))
+        .filter(models.ChatSession.id == session_id)
+        .first()
+    )
 
     if not session:
         raise HTTPException(
@@ -135,10 +138,12 @@ def get_chat_history(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(auth.get_current_user)
 ):
-    # 세션 확인
-    session = db.query(models.ChatSession).filter(
-        models.ChatSession.id == session_id
-    ).first()
+    session = (
+        db.query(models.ChatSession)
+        .options(joinedload(models.ChatSession.lecture))
+        .filter(models.ChatSession.id == session_id)
+        .first()
+    )
 
     if not session:
         raise HTTPException(
@@ -175,14 +180,18 @@ def update_session_title(
     db: Session = Depends(database.get_db),
     current_user: models.User = Depends(auth.get_current_user)
 ):
-    # 1. DB에서 해당 세션(대화방) 찾기 (id만으로 검색!)
-    session = db.query(models.ChatSession).filter(
-        models.ChatSession.id == session_id
-    ).first()
+    session = (
+        db.query(models.ChatSession)
+        .options(joinedload(models.ChatSession.lecture))
+        .filter(models.ChatSession.id == session_id)
+        .first()
+    )
 
-    # 2. 방이 없으면 에러 튕겨내기
     if not session:
         raise HTTPException(status_code=404, detail="대화방을 찾을 수 없습니다.")
+
+    if session.lecture.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="접근 권한이 없습니다.")
 
     # 3. 프론트에서 넘어온 새 이름(title)으로 변경 후 DB에 저장
     session.title = title

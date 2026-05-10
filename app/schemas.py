@@ -1,3 +1,4 @@
+from typing import Optional
 from pydantic import BaseModel, EmailStr
 
 # 회원가입 시 받을 데이터 양식
@@ -5,8 +6,8 @@ class UserCreate(BaseModel):
     email: EmailStr
     password: str
     nickname: str
-    department: str
-    grade: int
+    department: Optional[str] = None
+    grade: Optional[int] = None
 
 # 로그인 시 받을 데이터 양식 (이게 빠져서 에러가 난 거예요!)
 class UserLogin(BaseModel):
