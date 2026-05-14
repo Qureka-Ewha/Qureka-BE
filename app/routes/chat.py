@@ -4,6 +4,7 @@ from sqlalchemy import select
 from ..database import get_db
 from .. import models, auth, database
 from ..services import processing
+import os
 
 router = APIRouter()
 
@@ -15,6 +16,7 @@ router = APIRouter()
 async def talk_to_qureka(
     session_id: int,
     user_message: str = Form(...),
+    is_audio: bool = Form(False), 
     db: Session = Depends(get_db),
     current_user: models.User = Depends(auth.get_current_user)
 ):
@@ -63,9 +65,14 @@ async def talk_to_qureka(
     ).all()
 
     # 6. context 생성
-    context_text = "\n\n".join(
-        [f"[슬라이드 {c.page_number}]: {c.content}" for c in relevant_chunks]
-    )
+    if is_audio:
+        context_text = "\n\n".join(
+            [c.content for c in relevant_chunks]
+        )
+    else:
+        context_text = "\n\n".join(
+            [f"[슬라이드 {c.page_number}]: {c.content}" for c in relevant_chunks]
+        )
 
     # 7. 최근 대화 기록 조회 (최근 6개)
     history_msgs = db.query(models.ChatMessage).filter(
@@ -140,7 +147,10 @@ def get_chat_history(
 ):
     session = (
         db.query(models.ChatSession)
-        .options(joinedload(models.ChatSession.lecture))
+        .options(
+            joinedload(models.ChatSession.lecture)
+            .joinedload(models.Lecture.files)
+        )
         .filter(models.ChatSession.id == session_id)
         .first()
     )
@@ -163,14 +173,31 @@ def get_chat_history(
         models.ChatMessage.session_id == session_id
     ).order_by(models.ChatMessage.created_at.asc()).all()
 
-    return [
-        {
-            "role": m.role,
-            "content": m.content,
-            "created_at": m.created_at
-        }
-        for m in messages
-    ]
+
+    return {
+        "session_id": session.id,
+        "lecture_title": session.lecture.title,
+
+        "files": [
+            {
+                "file_id": f.id,
+                "file_name": f.original_name,
+                "file_type": f.file_type,
+                "file_url": f"/uploaded_files/{os.path.basename(f.file_url)}",
+                "is_confirmed": f.is_confirmed,
+            }
+            for f in session.lecture.files
+        ],
+
+        "messages": [
+            {
+                "role": m.role,
+                "content": m.content,
+                "created_at": m.created_at
+            }
+            for m in messages
+        ]
+    }
 
 # 🌟 대화방 이름 수정 API
 @router.patch("/sessions/{session_id}")

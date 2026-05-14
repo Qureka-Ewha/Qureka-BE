@@ -2,18 +2,25 @@ import os
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from dotenv import load_dotenv
 
+
 # 내부 모듈 임포트
 from . import models, schemas, auth, database
 from .routes import upload, chat, report, users   # report, users 추가
-
+  
 # 1. 환경 설정 로드
 load_dotenv()
 
 app = FastAPI(title="Qureka Unified Server")
+app.mount(
+    "/uploaded_files",
+    StaticFiles(directory="uploaded_files"),
+    name="uploaded_files"
+)
 
 # CORS: allow_credentials=True일 때 브라우저는 Allow-Origin: * 를 허용하지 않습니다.
 # (크리덴셜 요청 시 API가 브라우저에서 계속 차단되는 흔한 원인)

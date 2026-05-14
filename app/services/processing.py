@@ -1,10 +1,11 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import fitz  # PyMuPDF
-import whisper
 import os
 import re
 import io
 import random
+import requests  
+import json     
 from typing import Dict, List, Tuple
 from google import genai
 from google.genai import types
@@ -14,7 +15,6 @@ load_dotenv()
 
 # Gemini 설정 (SDK 1.0.0+ 기준)
 client = genai.Client(api_key = os.getenv("GEMINI_API_KEY"))
-STT_MODEL = whisper.load_model("turbo")
 
 _PDF_MATRIX_SCALE = float(os.getenv("PDF_RENDER_SCALE", "1.75"))
 _NATIVE_TEXT_MIN_CHARS = int(os.getenv("PDF_NATIVE_TEXT_MIN_CHARS", "50"))
@@ -97,7 +97,7 @@ def extract_from_pdf(file_bytes: bytes) -> List[Tuple[str, int]]:
                     pn,
                 )
             except Exception as e:
-                print(f"❌ {pn}페이지 API 에러: {e}")
+                print(f"{pn}페이지 API 에러: {e}")
                 return (
                     fb or f"에러 발생으로 분석 실패: {e}",
                     pn,
@@ -112,6 +112,9 @@ def extract_from_pdf(file_bytes: bytes) -> List[Tuple[str, int]]:
 
     combined = native_pages + vision_results
     combined.sort(key=lambda x: x[1])
+
+    print(f"PDF 추출 완료 - 총 {len(combined)}페이지")
+
     return combined
 
 
@@ -230,7 +233,7 @@ C. 답변에 따른 대응 로직 (Response Logic)
 > Qureka: 괜찮습니다. [슬라이드 4]를 보면 CPU의 사이클 타임과 IPC의 관계가 나오는데, 여기서 IPC가 고정되었을 때 성능을 높일 수 있는 다른 변수는 무엇이었나요?
 """
 
-def select_key_chunks(lecture_pages, max_pages=3):
+def select_key_chunks(lecture_pages, max_pages=3, include_page_tag=True):
     first_page = lecture_pages[0]   # 첫 페이지는 무조건 포함
     others = lecture_pages[1:]
 
@@ -242,18 +245,30 @@ def select_key_chunks(lecture_pages, max_pages=3):
 
     scored.sort(reverse=True)
 
-    selected = [first_page] + [(text, page_num) for _, text, page_num in scored[:2]]
+    selected = [first_page] + [
+        (text, page_num)
+        for _, text, page_num in scored[:max_pages - 1]
+    ]
 
-    result = "\n".join([
-        f"[슬라이드 {page_num}]\n{text}"
-        for text, page_num in selected
-    ])
+    if include_page_tag:
+        result = "\n".join([
+            f"[슬라이드 {page_num}]\n{text}"
+            for text, page_num in selected
+        ])
+    else:
+        result = "\n".join([
+            text
+            for text, _ in selected
+        ])
 
     return result
 
 def generate_initial_question(lecture_pages, dept: str | None, grade: int | None, lecture_title: str) -> str:
     """강의 자료 확정 시 사용자의 학과/학년에 맞춘 첫 번째 질문 생성"""
-    selected_text = select_key_chunks(lecture_pages)
+    selected_text = select_key_chunks(
+        lecture_pages,
+        include_page_tag=not is_audio
+    )
     system_prompt = get_qureka_system_prompt(dept, grade, lecture_title)
     prompt = f"""
     {system_prompt}
@@ -351,11 +366,66 @@ def get_embeddings(text_list: List[str]):
         )
         return [item.values for item in result.embeddings]
     except Exception as e:
-        print(f"❌ 임베딩 실패: {e}")
+        print(f"임베딩 실패: {e}")
         return [[random.uniform(-1, 1) for _ in range(3072)] for _ in text_list]
 
 
 def transcribe_audio(audio_path: str):
-    print(f"--- 음성 인식 시작: {audio_path} ---")
-    result = STT_MODEL.transcribe(audio_path)
-    return result['text']
+    print(f"--- Clova Speech 음성 인식 시작: {audio_path} ---")
+
+    if not os.path.exists(audio_path):
+        return "오디오 파일이 존재하지 않습니다."
+
+    invoke_url = os.getenv("CLOVA_SPEECH_INVOKE_URL")
+    secret_key = os.getenv("CLOVA_SPEECH_SECRET_KEY")
+
+    if not invoke_url or not secret_key:
+        return "Clova Speech API 설정이 없습니다."
+
+    url = f"{invoke_url.rstrip('/')}/recognizer/upload"
+
+    request_body = {
+        "language": "ko-KR",
+        "completion": "sync",
+        "fullText": True
+    }
+
+    headers = {
+        "Accept": "application/json",
+        "X-CLOVASPEECH-API-KEY": secret_key
+    }
+
+    try:
+        with open(audio_path, "rb") as f:
+            files = {
+                "media": f,
+                "params": (
+                    None,
+                    json.dumps(request_body),
+                    "application/json"
+                )
+            }
+
+            response = requests.post(
+                url,
+                headers=headers,
+                files=files,
+                timeout=30
+            )
+
+        response.raise_for_status()
+
+        result = response.json()
+
+        print(f"--- Clova Speech 추출 성공 ({audio_path}) ---")
+
+        return result.get("text", "인식된 내용이 없습니다.")
+
+    except requests.exceptions.Timeout:
+        return "음성 인식 요청 시간이 초과되었습니다."
+
+    except requests.exceptions.RequestException as e:
+        return f"Clova API 요청 오류: {e}"
+
+    except Exception as e:
+        return f"음성 처리 중 오류 발생: {str(e)}"

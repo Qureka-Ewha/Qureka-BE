@@ -37,6 +37,7 @@ class UploadedFile(Base):
     lecture_id = Column(Integer, ForeignKey("lectures.id", ondelete="CASCADE"))
     file_url = Column(String, nullable=False)
     file_type = Column(String, nullable=False)
+    original_name = Column(String, nullable=True)
     text_content = Column(Text, nullable=True) 
     page_text = Column(Text, nullable=True)
     is_confirmed = Column(Boolean, default=False)

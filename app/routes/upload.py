@@ -3,6 +3,7 @@ from sqlalchemy.orm import Session, joinedload
 from ..database import get_db, SessionLocal
 from .. import models, auth
 from ..services import processing
+from typing import List
 import shutil
 import os
 import json
@@ -85,7 +86,7 @@ def process_file_chunks(file_id: int):
                     else []
                 )
             else:
-                fallback = [(file_rec.text_content or "", 1)]
+                fallback = [(file_rec.text_content or "", None)]
             if not fallback or not (fallback[0][0] or "").strip():
                 return
             chunks_with_page = processing.chunk_text_with_page(fallback)
@@ -117,66 +118,98 @@ def _looks_like_extraction_error(text: str | None) -> bool:
 
 
 @router.post("/upload")
-async def upload_file(
+async def upload_files(
     background_tasks: BackgroundTasks,
     lecture_title: str = Form(...),
-    file: UploadFile = File(...),
+    files: List[UploadFile] = File(...),
     db: Session = Depends(get_db),
     current_user: models.User = Depends(auth.get_current_user),
 ):
-    orig_name = os.path.basename(file.filename or "") or "upload"
-    _, ext = os.path.splitext(orig_name)
-    stored_name = f"{uuid.uuid4().hex}{ext}"
-    file_path = os.path.join(UPLOAD_DIR, stored_name)
-
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-
-    tl = orig_name.lower()
-    if not (
-        tl.endswith(".pdf")
-        or tl.endswith((".mp3", ".wav", ".m4a"))
-    ):
-        try:
-            os.remove(file_path)
-        except OSError:
-            pass
-        raise HTTPException(status_code=400, detail="지원하지 않는 파일 형식입니다.")
 
     uid = current_user.id
+
+    # 같은 강의명 있으면 재사용
     lecture = db.query(models.Lecture).filter(
         models.Lecture.title == lecture_title,
         models.Lecture.user_id == uid,
     ).first()
 
+    # 없으면 새 생성
     if not lecture:
-        lecture = models.Lecture(title=lecture_title, user_id=uid)
+        lecture = models.Lecture(
+            title=lecture_title,
+            user_id=uid
+        )
         db.add(lecture)
         db.commit()
         db.refresh(lecture)
 
-    new_file = models.UploadedFile(
-        lecture_id=lecture.id,
-        file_url=file_path,
-        file_type=file.content_type,
-        text_content=None,
-        is_confirmed=False,
-    )
-    db.add(new_file)
-    db.commit()
-    db.refresh(new_file)
+    uploaded_results = []
 
-    background_tasks.add_task(extract_media_to_file_record, new_file.id)
-    print(f"📡 업로드 수신 후 백그라운드 추출 예약(file_id={new_file.id}): {orig_name}")
+    # 여러 파일 반복 처리
+    for file in files:
+
+        orig_name = os.path.basename(file.filename or "") or "upload"
+
+        _, ext = os.path.splitext(orig_name)
+
+        stored_name = f"{uuid.uuid4().hex}{ext}"
+
+        file_path = os.path.join(UPLOAD_DIR, stored_name)
+
+        # 파일 저장
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+
+        tl = orig_name.lower()
+
+        # 지원 파일 형식 검사
+        if not (
+            tl.endswith(".pdf")
+            or tl.endswith((".mp3", ".wav", ".m4a"))
+        ):
+            try:
+                os.remove(file_path)
+            except OSError:
+                pass
+
+            continue
+
+        # DB 저장
+        new_file = models.UploadedFile(
+            lecture_id=lecture.id,
+            file_url=file_path,
+            file_type=file.content_type,
+            original_name=orig_name,
+            text_content=None,
+            is_confirmed=False,
+        )
+
+        db.add(new_file)
+        db.commit()
+        db.refresh(new_file)
+
+        # 백그라운드 텍스트 추출
+        background_tasks.add_task(
+            extract_media_to_file_record,
+            new_file.id
+        )
+
+        print(
+            f"업로드 수신 후 백그라운드 추출 예약(file_id={new_file.id}): {orig_name}"
+        )
+
+        uploaded_results.append({
+            "file_id": new_file.id,
+            "filename": orig_name,
+            "extraction_pending": True,
+        })
 
     return {
-        "file_id": new_file.id,
         "lecture_id": lecture.id,
         "user_id": uid,
-        "extracted_text": None,
-        "extraction_pending": True,
+        "uploaded_files": uploaded_results,
     }
-
 
 @router.get("/upload/{file_id}/extraction")
 def get_extraction_status(
@@ -282,7 +315,7 @@ async def confirm_file(
         pages_json = json.loads(file_rec.page_text)
         lecture_pages = [(item["text"], item["page"]) for item in pages_json]
     else:
-        lecture_pages = [(file_rec.text_content, 1)]
+        lecture_pages = [(file_rec.text_content, None)]
 
     # 5. AI 첫 질문 생성 (강의명 포함)
     first_question = processing.generate_initial_question(
