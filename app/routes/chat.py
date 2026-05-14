@@ -9,6 +9,31 @@ import os
 router = APIRouter()
 
 
+def _session_source_kind(session: models.ChatSession, db: Session) -> processing.SourceKind:
+    """세션에 저장된 source_kind 우선, 없으면 단일 파일·업로드 묶음으로 추론."""
+    if session.source_kind in ("pdf", "transcript"):
+        return session.source_kind  # type: ignore[return-value]
+    if session.file_id:
+        uf = (
+            db.query(models.UploadedFile)
+            .filter(models.UploadedFile.id == session.file_id)
+            .first()
+        )
+        if uf and processing.is_transcript_style_file(uf.file_url):
+            return "transcript"
+        return "pdf"
+    if session.upload_group_id and session.lecture and session.lecture.files:
+        gfiles = [
+            f
+            for f in session.lecture.files
+            if f.upload_group_id == session.upload_group_id
+        ]
+        if any(f.file_url.lower().endswith(".pdf") for f in gfiles):
+            return "pdf"
+        return "transcript"
+    return "pdf"
+
+
 # ---------------------------------------------------------
 # 1️⃣ AI 튜터와 대화하기
 # ---------------------------------------------------------
@@ -16,14 +41,15 @@ router = APIRouter()
 async def talk_to_qureka(
     session_id: int,
     user_message: str = Form(...),
-    is_audio: bool = Form(False), 
     db: Session = Depends(get_db),
     current_user: models.User = Depends(auth.get_current_user)
 ):
     # 1. 세션 존재 여부 확인 (lecture는 권한·제목 조회 시 즉시 로드)
     session = (
         db.query(models.ChatSession)
-        .options(joinedload(models.ChatSession.lecture))
+        .options(
+            joinedload(models.ChatSession.lecture).joinedload(models.Lecture.files)
+        )
         .filter(models.ChatSession.id == session_id)
         .first()
     )
@@ -64,8 +90,9 @@ async def talk_to_qureka(
         .limit(3)
     ).all()
 
-    # 6. context 생성
-    if is_audio:
+    # 6. context 생성 (PDF는 슬라이드 태그, 음성 전사는 본문만 — 세션의 파일로 자동 판별)
+    source_kind = _session_source_kind(session, db)
+    if source_kind == "transcript":
         context_text = "\n\n".join(
             [c.content for c in relevant_chunks]
         )
@@ -91,7 +118,8 @@ async def talk_to_qureka(
         chat_history=chat_history_str,
         dept=current_user.department,
         grade=current_user.grade,
-        lecture_title=lecture_title  # ✅ 핵심 수정: 강의명 반영
+        lecture_title=lecture_title,
+        source_kind=source_kind,
     )
 
     # 9. AI 메시지 저장
@@ -104,12 +132,17 @@ async def talk_to_qureka(
     db.add(new_ai_msg)
     db.commit()
 
-    # 10. 결과 반환 (원본과 동일하게 출처 페이지 포함)
-    return {
-        "ai_reply": ai_reply,
-        "source_pages": list(
+    # 10. 결과 반환 (음성 전사 세션은 출처 페이지 없음)
+    source_pages = (
+        []
+        if source_kind == "transcript"
+        else list(
             set([c.page_number for c in relevant_chunks if c.page_number])
         )
+    )
+    return {
+        "ai_reply": ai_reply,
+        "source_pages": source_pages,
     }
 
 
@@ -173,10 +206,14 @@ def get_chat_history(
         models.ChatMessage.session_id == session_id
     ).order_by(models.ChatMessage.created_at.asc()).all()
 
+    source_kind = _session_source_kind(session, db)
 
     return {
         "session_id": session.id,
         "lecture_title": session.lecture.title,
+        "source_kind": source_kind,
+        "upload_group_id": session.upload_group_id,
+        "linked_file_id": session.file_id,
 
         "files": [
             {

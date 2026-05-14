@@ -15,6 +15,47 @@ from .routes import upload, chat, report, users   # report, users 추가
 # 1. 환경 설정 로드
 load_dotenv()
 
+
+def _upgrade_schema_postgres():
+    url = str(database.engine.url)
+    if "postgresql" not in url:
+        return
+    stmts = [
+        "ALTER TABLE uploaded_files ADD COLUMN IF NOT EXISTS upload_group_id VARCHAR(64)",
+        "ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS source_kind VARCHAR(20)",
+        "ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS upload_group_id VARCHAR(64)",
+    ]
+    with database.engine.begin() as conn:
+        for s in stmts:
+            try:
+                conn.execute(text(s))
+            except Exception as e:
+                print(f"[schema] {s}: {e}")
+        try:
+            conn.execute(
+                text(
+                    "ALTER TABLE chat_sessions DROP CONSTRAINT IF EXISTS "
+                    "chat_sessions_file_id_fkey"
+                )
+            )
+        except Exception as e:
+            print(f"[schema] drop file_id fk: {e}")
+        try:
+            conn.execute(
+                text("ALTER TABLE chat_sessions ALTER COLUMN file_id DROP NOT NULL")
+            )
+        except Exception as e:
+            print(f"[schema] file_id nullable: {e}")
+        try:
+            conn.execute(
+                text(
+                    "ALTER TABLE chat_sessions ADD CONSTRAINT chat_sessions_file_id_fkey "
+                    "FOREIGN KEY (file_id) REFERENCES uploaded_files(id) ON DELETE SET NULL"
+                )
+            )
+        except Exception as e:
+            print(f"[schema] add file_id fk: {e}")
+
 app = FastAPI(title="Qureka Unified Server")
 app.mount(
     "/uploaded_files",
@@ -59,6 +100,9 @@ def startup_event():
 
     # 2) 테이블 자동 생성
     models.Base.metadata.create_all(bind=database.engine)
+
+    # 3) 기존 PostgreSQL DB에 컬럼·FK 변경 반영 (create_all은 컬럼 추가를 안 함)
+    _upgrade_schema_postgres()
 
 
 # 3. 라우터 연결

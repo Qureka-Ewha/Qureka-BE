@@ -3,7 +3,8 @@ from sqlalchemy.orm import Session, joinedload
 from ..database import get_db, SessionLocal
 from .. import models, auth
 from ..services import processing
-from typing import List
+from typing import List, Tuple
+
 import shutil
 import os
 import json
@@ -41,6 +42,9 @@ def extract_media_to_file_record(file_id: int):
             elif key.endswith((".mp3", ".wav", ".m4a")):
                 file_rec.page_text = None
                 file_rec.text_content = processing.transcribe_audio(path)
+            elif key.endswith(".txt"):
+                file_rec.page_text = None
+                file_rec.text_content = processing.read_uploaded_txt_file(path)
             else:
                 file_rec.text_content = "[지원하지 않는 파일 형식입니다]"
                 file_rec.page_text = None
@@ -117,6 +121,85 @@ def _looks_like_extraction_error(text: str | None) -> bool:
     )
 
 
+def _group_peers(db: Session, file_rec: models.UploadedFile) -> List[models.UploadedFile]:
+    """동일 업로드 묶음(또는 레거시 단일 파일)에 속한 UploadedFile 목록."""
+    q = db.query(models.UploadedFile).filter(
+        models.UploadedFile.lecture_id == file_rec.lecture_id,
+    )
+    if file_rec.upload_group_id:
+        q = q.filter(models.UploadedFile.upload_group_id == file_rec.upload_group_id)
+    else:
+        q = q.filter(models.UploadedFile.id == file_rec.id)
+    return q.order_by(models.UploadedFile.id.asc()).all()
+
+
+def _batch_source_kind(peers: List[models.UploadedFile]) -> processing.SourceKind:
+    for p in peers:
+        if p.file_url.lower().endswith(".pdf"):
+            return "pdf"
+    return "transcript"
+
+
+def build_combined_lecture_pages(
+    peers: List[models.UploadedFile],
+) -> List[Tuple[str, int | None]]:
+    """묶음 내 모든 파일 텍스트를 페이지 리스트로 병합 (PDF는 페이지 단위, 그 외는 블록)."""
+    pages: List[Tuple[str, int | None]] = []
+    page_counter = 1
+    for f in peers:
+        key = f.file_url.lower()
+        name = f.original_name or "파일"
+        if key.endswith(".pdf") and f.page_text:
+            try:
+                arr = json.loads(f.page_text)
+                added_pages = 0
+                for item in arr:
+                    t = (item.get("text") or "").strip()
+                    if not t:
+                        continue
+                    pages.append((t, page_counter))
+                    page_counter += 1
+                    added_pages += 1
+                if added_pages > 0:
+                    continue
+            except (json.JSONDecodeError, KeyError, TypeError, AttributeError):
+                pass
+        body = (f.text_content or "").strip()
+        if body:
+            pages.append((f"[자료: {name}]\n{body}", None))
+    if not pages:
+        return [("", None)]
+    return pages
+
+
+def _find_existing_batch_session(
+    db: Session,
+    lecture_id: int,
+    upload_group_id: str | None,
+    single_peer_id: int | None,
+) -> models.ChatSession | None:
+    if upload_group_id:
+        return (
+            db.query(models.ChatSession)
+            .filter(
+                models.ChatSession.lecture_id == lecture_id,
+                models.ChatSession.upload_group_id == upload_group_id,
+            )
+            .first()
+        )
+    if single_peer_id is not None:
+        return (
+            db.query(models.ChatSession)
+            .filter(
+                models.ChatSession.lecture_id == lecture_id,
+                models.ChatSession.file_id == single_peer_id,
+                models.ChatSession.upload_group_id.is_(None),
+            )
+            .first()
+        )
+    return None
+
+
 @router.post("/upload")
 async def upload_files(
     background_tasks: BackgroundTasks,
@@ -146,6 +229,8 @@ async def upload_files(
 
     uploaded_results = []
 
+    upload_group_id = str(uuid.uuid4())
+
     # 여러 파일 반복 처리
     for file in files:
 
@@ -166,7 +251,7 @@ async def upload_files(
         # 지원 파일 형식 검사
         if not (
             tl.endswith(".pdf")
-            or tl.endswith((".mp3", ".wav", ".m4a"))
+            or tl.endswith((".mp3", ".wav", ".m4a", ".txt"))
         ):
             try:
                 os.remove(file_path)
@@ -183,31 +268,52 @@ async def upload_files(
             original_name=orig_name,
             text_content=None,
             is_confirmed=False,
+            upload_group_id=upload_group_id,
         )
 
         db.add(new_file)
         db.commit()
         db.refresh(new_file)
 
-        # 백그라운드 텍스트 추출
-        background_tasks.add_task(
-            extract_media_to_file_record,
-            new_file.id
-        )
+        # txt는 OCR/STT 없이 즉시 본문 반영 → 수정 화면 바로 표시
+        if tl.endswith(".txt"):
+            try:
+                new_file.text_content = processing.read_uploaded_txt_file(file_path)
+                new_file.page_text = None
+                db.commit()
+                db.refresh(new_file)
+                extraction_pending = False
+            except Exception as e:
+                new_file.page_text = None
+                new_file.text_content = f"[텍스트 추출 오류] {e}"
+                db.commit()
+                db.refresh(new_file)
+                extraction_pending = False
+            print(f"txt 즉시 로드(file_id={new_file.id}): {orig_name}")
+        else:
+            background_tasks.add_task(
+                extract_media_to_file_record,
+                new_file.id,
+            )
+            extraction_pending = True
+            print(
+                f"업로드 수신 후 백그라운드 추출 예약(file_id={new_file.id}): {orig_name}"
+            )
 
-        print(
-            f"업로드 수신 후 백그라운드 추출 예약(file_id={new_file.id}): {orig_name}"
-        )
-
-        uploaded_results.append({
+        result_entry = {
             "file_id": new_file.id,
             "filename": orig_name,
-            "extraction_pending": True,
-        })
+            "upload_group_id": upload_group_id,
+            "extraction_pending": extraction_pending,
+        }
+        if tl.endswith(".txt"):
+            result_entry["extracted_text"] = new_file.text_content
+        uploaded_results.append(result_entry)
 
     return {
         "lecture_id": lecture.id,
         "user_id": uid,
+        "upload_group_id": upload_group_id,
         "uploaded_files": uploaded_results,
     }
 
@@ -236,9 +342,49 @@ def get_extraction_status(
     )
     return {
         "file_id": file_id,
+        "upload_group_id": file_rec.upload_group_id,
+        "is_confirmed": file_rec.is_confirmed,
         "pending": pending,
         "failure": err,
         "extracted_text": None if pending else file_rec.text_content,
+    }
+
+# ---------------------------------------------------------
+# 동일 POST 업로드 묶음 상태 (파일별 검토·확정 진행률)
+# ---------------------------------------------------------
+@router.get("/upload/batch/{upload_group_id}")
+def get_upload_batch_status(
+    upload_group_id: str,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user),
+):
+    files = (
+        db.query(models.UploadedFile)
+        .join(models.Lecture)
+        .filter(
+            models.Lecture.user_id == current_user.id,
+            models.UploadedFile.upload_group_id == upload_group_id,
+        )
+        .order_by(models.UploadedFile.id.asc())
+        .all()
+    )
+    if not files:
+        raise HTTPException(status_code=404, detail="해당 업로드 묶음을 찾을 수 없습니다.")
+    return {
+        "upload_group_id": upload_group_id,
+        "lecture_id": files[0].lecture_id,
+        "total": len(files),
+        "all_confirmed": all(f.is_confirmed for f in files),
+        "files": [
+            {
+                "file_id": f.id,
+                "filename": f.original_name,
+                "extraction_pending": f.text_content is None,
+                "extraction_failure": _looks_like_extraction_error(f.text_content),
+                "is_confirmed": f.is_confirmed,
+            }
+            for f in files
+        ],
     }
 
 # ---------------------------------------------------------
@@ -267,7 +413,7 @@ async def update_text(
     return {"message": "임시 저장되었습니다."}
 
 # ---------------------------------------------------------
-# 3️⃣ [POST] 파일 확정 및 소크라테스 대화 시작
+# 3️⃣ [POST] 파일 확정 — 동일 업로드 묶음은 모두 확정된 뒤에만 튜터·첫 질문 시작
 # ---------------------------------------------------------
 @router.post("/confirm/{file_id}")
 async def confirm_file(
@@ -288,64 +434,121 @@ async def confirm_file(
         raise HTTPException(status_code=403, detail="접근 권한이 없습니다.")
 
     db.refresh(file_rec)
-    if file_rec.text_content is None:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "파일 분석이 아직 끝나지 않았습니다. "
-                "잠시 후 다시 확정해 주세요. (진행 상태: GET /files/upload/{}/extraction)".format(
-                    file_id,
+
+    peers = _group_peers(db, file_rec)
+    for p in peers:
+        if p.text_content is None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"파일 '{p.original_name or p.id}' 분석이 아직 끝나지 않았습니다. "
+                    f"(GET /files/upload/{p.id}/extraction)"
                 ),
-            ),
+            )
+        if _looks_like_extraction_error(p.text_content):
+            raise HTTPException(
+                status_code=409,
+                detail=f"추출에 실패한 파일이 있어 확정할 수 없습니다: {p.original_name}",
+            )
+
+    user = file_rec.lecture.user
+    lecture_title = file_rec.lecture.title
+    gid = file_rec.upload_group_id
+    single_peer_id = peers[0].id if len(peers) == 1 and not gid else None
+
+    existing = _find_existing_batch_session(
+        db, file_rec.lecture_id, gid, single_peer_id
+    )
+    if existing:
+        first_ai = (
+            db.query(models.ChatMessage)
+            .filter(models.ChatMessage.session_id == existing.id)
+            .order_by(models.ChatMessage.id.asc())
+            .first()
         )
+        fq = (
+            first_ai.content
+            if first_ai and first_ai.role == "assistant"
+            else ""
+        )
+        sk: processing.SourceKind = (
+            existing.source_kind
+            if existing.source_kind in ("pdf", "transcript")
+            else _batch_source_kind(peers)
+        )
+        return {
+            "status": "batch_complete",
+            "message": "이미 모든 파일이 확정되어 튜터를 시작했습니다.",
+            "session_id": existing.id,
+            "first_question": fq,
+            "source_kind": sk,
+            "upload_group_id": gid,
+        }
 
-    user = file_rec.lecture.user 
-    lecture_title = file_rec.lecture.title # 강의 제목 확보
+    if not file_rec.is_confirmed:
+        file_rec.is_confirmed = True
+        db.commit()
 
-    # 2. 확정 상태 업데이트
-    file_rec.is_confirmed = True
-    db.commit()
+    peers = _group_peers(db, file_rec)
+    pending = [p for p in peers if not p.is_confirmed]
+    if pending:
+        return {
+            "status": "awaiting_other_files",
+            "message": (
+                "같은 업로드 묶음에 아직 검토·확정하지 않은 파일이 있습니다. "
+                "나머지 파일도 수정 후 확정해 주세요."
+            ),
+            "upload_group_id": gid,
+            "total_in_group": len(peers),
+            "confirmed_count": len([p for p in peers if p.is_confirmed]),
+            "pending_files": [
+                {"file_id": p.id, "filename": p.original_name} for p in pending
+            ],
+        }
 
-    # 3. 백그라운드 임베딩 작업 시작
-    background_tasks.add_task(process_file_chunks, file_id)
+    for p in peers:
+        background_tasks.add_task(process_file_chunks, p.id)
 
-    # 4. 첫 질문 생성을 위한 페이지 데이터 구성
-    # (추출된 페이지 정보가 있으면 활용하고, 없으면 전체 텍스트를 1페이지로 처리)
-    if file_rec.page_text:
-        pages_json = json.loads(file_rec.page_text)
-        lecture_pages = [(item["text"], item["page"]) for item in pages_json]
-    else:
-        lecture_pages = [(file_rec.text_content, None)]
-
-    # 5. AI 첫 질문 생성 (강의명 포함)
+    lecture_pages = build_combined_lecture_pages(peers)
+    source_kind = _batch_source_kind(peers)
     first_question = processing.generate_initial_question(
         lecture_pages=lecture_pages,
         dept=user.department,
         grade=user.grade,
-        lecture_title=lecture_title
+        lecture_title=lecture_title,
+        source_kind=source_kind,
     )
 
-    # 6. 새 대화 세션 생성
+    session_file_id = None
+    session_upload_gid = gid
+    if len(peers) == 1 and not gid:
+        session_file_id = peers[0].id
+        session_upload_gid = None
+
     new_session = models.ChatSession(
         lecture_id=file_rec.lecture_id,
-        file_id=file_rec.id,
+        file_id=session_file_id,
         title=f"{lecture_title} · 새 대화",
+        source_kind=source_kind,
+        upload_group_id=session_upload_gid,
     )
     db.add(new_session)
     db.commit()
     db.refresh(new_session)
 
-    # 7. 첫 AI 메시지 저장
     ai_message = models.ChatMessage(
         session_id=new_session.id,
         role="assistant",
-        content=first_question
+        content=first_question,
     )
     db.add(ai_message)
     db.commit()
 
     return {
-        "message": "확정 완료! AI 튜터 Qureka가 첫 질문을 보냈습니다.",
+        "status": "batch_complete",
+        "message": "확정 완료! 업로드한 모든 자료를 반영해 첫 질문을 보냈습니다.",
         "session_id": new_session.id,
-        "first_question": first_question
+        "first_question": first_question,
+        "source_kind": source_kind,
+        "upload_group_id": gid,
     }

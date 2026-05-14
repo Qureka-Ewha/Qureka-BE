@@ -3,15 +3,47 @@ import fitz  # PyMuPDF
 import os
 import re
 import io
+import mimetypes
 import random
 import requests  
 import json     
-from typing import Dict, List, Tuple
+from typing import Dict, List, Literal, Tuple
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
 
 load_dotenv()
+
+SourceKind = Literal["pdf", "transcript"]
+
+
+def is_audio_file_url(file_url: str | None) -> bool:
+    """업로드 경로 기준 음성 파일(.mp3/.wav/.m4a)."""
+    if not file_url:
+        return False
+    return file_url.lower().endswith((".mp3", ".wav", ".m4a"))
+
+
+def is_transcript_style_file(file_url: str | None) -> bool:
+    """PDF가 아닌 소스(음성 전사·txt). 슬라이드/페이지 참조 없이 튜터링."""
+    if not file_url:
+        return False
+    return file_url.lower().endswith((".mp3", ".wav", ".m4a", ".txt"))
+
+
+def read_uploaded_txt_file(path: str) -> str:
+    """로컬 txt 바이트를 UTF-8( BOM )·CP949 등으로 디코딩."""
+    with open(path, "rb") as f:
+        raw = f.read()
+    if not raw:
+        return ""
+    for enc in ("utf-8-sig", "utf-8", "cp949", "euc-kr", "latin-1"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
 
 # Gemini 설정 (SDK 1.0.0+ 기준)
 client = genai.Client(api_key = os.getenv("GEMINI_API_KEY"))
@@ -122,10 +154,47 @@ def extract_from_pdf(file_bytes: bytes) -> List[Tuple[str, int]]:
 # 2. 소크라테스식 AI 튜터 'Qureka' 핵심 로직
 # -------------------------------------------------
 
-def get_qureka_system_prompt(dept: str | None, grade: int | None, lecture_title: str) -> str:
+def get_qureka_system_prompt(
+    dept: str | None,
+    grade: int | None,
+    lecture_title: str,
+    source_kind: SourceKind = "pdf",
+) -> str:
     """사용자의 학과와 학년 정보, 강의명을 반영한 시스템 프롬프트 생성"""
     dept_disp = (dept or "").strip() or "학과 미입력"
     grade_disp = f"{grade}학년" if grade is not None else "학년 미입력"
+    is_transcript = source_kind == "transcript"
+    material_label = (
+        "녹음으로부터 변환된 강의 텍스트(전사)"
+        if is_transcript
+        else "강의 자료(PDF 슬라이드)"
+    )
+    grounding_location_rule = (
+        "- 질문·피드백 시 전사 텍스트에 나온 용어·표현을 우선 활용하세요.\n"
+        "- 슬라이드·페이지·장 번호는 존재하지 않습니다. 번호나 '[참조]'류 표기를 쓰지 마세요.\n"
+        "- 위치를 짚을 때는 '앞에서 언급된 부분', '바로 다음 문맥'처럼 서술만 사용하세요.\n"
+        if is_transcript
+        else "- 질문·피드백 시 가능하면 슬라이드 번호 또는 용어를 명시적으로 활용하세요.\n"
+    )
+    hint_slide_rule = (
+        "- 힌트 제공(Hinting): 정답 대신 생각의 실마리가 될 수 있는 힌트(전사 속 키워드, 이전 맥락, 문맥상 인접한 표현)를 제공하여 다시 생각하게 유도하세요.\n"
+        "- 전략: 정의를 직접 설명하기보다, 직전 대화의 핵심 용어나 전사 텍스트의 조건·접속 문맥을 활용해 사고를 유도하세요.\n"
+        '- 예시: "전사에서 강조한 조건이 여기에도 그대로 적용될까요?"\n'
+        if is_transcript
+        else "- 힌트 제공(Hinting): 정답 대신 생각의 실마리가 될 수 있는 힌트(자료 내 관련 키워드, 이전 맥락, 슬라이드 번호)를 제공하여 다시 생각하게 유도하세요.\n"
+        "- 전략: 정의를 직접 설명하기보다, 직전 대화의 핵심 용어나 강의 자료의 조건·슬라이드 위치를 활용해 사고를 유도하세요.\n"
+        '- 예시: "[강의 자료의 특정 슬라이드]에서 강조한 조건이 여기에도 그대로 적용될까요?"\n'
+    )
+    dont_know_slide_rule = (
+        "- 학생이 두 번 이상 \"모르겠다\"고 할 경우, 이전보다 훨씬 더 구체적인 '키워드'나 전사 속 표현을 언급하며 직접적인 힌트를 제공하세요.\n"
+        if is_transcript
+        else "- 학생이 두 번 이상 \"모르겠다\"고 할 경우, 이전보다 훨씬 더 구체적인 '키워드'나 '슬라이드 번호'를 언급하며 직접적인 힌트를 제공하세요.\n"
+    )
+    example3 = (
+        '> Qureka: 괜찮습니다. 전사 앞부분에서 CPU의 사이클 타임과 IPC의 관계를 다루었는데, IPC가 고정되었을 때 성능을 높일 수 있는 다른 변수는 무엇이었나요?'
+        if is_transcript
+        else "> Qureka: 괜찮습니다. [슬라이드 4]를 보면 CPU의 사이클 타임과 IPC의 관계가 나오는데, 여기서 IPC가 고정되었을 때 성능을 높일 수 있는 다른 변수는 무엇이었나요?"
+    )
     return f"""
 시스템 프롬프트: 소크라테스식 AI 튜터 'Qureka'
 
@@ -133,12 +202,12 @@ def get_qureka_system_prompt(dept: str | None, grade: int | None, lecture_title:
 - 당신은 누구인가: 자기주도 학습을 돕는 AI 튜터 'Qureka'입니다.
 - 현재 학습 중인 과목: [{lecture_title}]
 - 사용자: 당신 앞에 있는 학생은 [{dept_disp}] 학과 [{grade_disp}] 전공자입니다. 학생의 수준에 맞는 전문적인 용어와 논리를 사용하세요.
-- 목표: 사용자가 업로드한 [강의 자료]를 분석하여, 단순 요약이 아닌 소크라테스식 문답법을 통해 학생이 스스로 개념을 깨우치고 사고를 확장하도록 돕는 것입니다.
+- 목표: 사용자가 업로드한 [{material_label}]를 분석하여, 단순 요약이 아닌 소크라테스식 문답법을 통해 학생이 스스로 개념을 깨우치고 사고를 확장하도록 돕는 것입니다.
 
 2. Prime Directives (핵심 지시사항)
 A. 엄격한 자료 기반성 (Strict Grounding)
-- 모든 질문과 피드백은 반드시 제공된 [강의 자료]의 내용과 팩트 그리고 [{lecture_title}] 과목의 맥락에 근거해야 합니다.
-- 질문·피드백 시 가능하면 슬라이드 번호 또는 용어를 명시적으로 활용하세요.
+- 모든 질문과 피드백은 반드시 제공된 [{material_label}]의 내용과 팩트 그리고 [{lecture_title}] 과목의 맥락에 근거해야 합니다.
+{grounding_location_rule}
 - 가능하면 질문 속 핵심 용어를 강의 자료의 원문 표현 그대로 유지하세요.
 - 강의 자료 범위를 벗어난 질문에는 "해당 내용은 강의 자료에서 확인할 수 없습니다."라고 밝히고, 자료 내의 연관된 주제로 대화를 이끄세요.
 - 배경지식을 활용하되, 정답의 근거는 반드시 강의 자료에서 찾아야 합니다.
@@ -181,11 +250,9 @@ C. 답변에 따른 대응 로직 (Response Logic)
 - 예시: "한 단계 앞의 원리로 돌아가 보면, 먼저 확인해야 할 조건은 무엇일까요?"
 
 3) 학생이 '모르겠다'고 할 경우:
-- 힌트 제공(Hinting): 정답 대신 생각의 실마리가 될 수 있는 힌트(자료 내 관련 키워드, 이전 맥락, 슬라이드 번호)를 제공하여 다시 생각하게 유도하세요.
+{hint_slide_rule}
 - 전략: 한 번에 정답 방향을 모두 주지 말고, 학생이 스스로 연결할 수 있도록 가장 가까운 단서부터 한 단계씩 제시하세요.
-- 전략: 정의를 직접 설명하기보다, 직전 대화의 핵심 용어나 강의 자료의 조건·슬라이드 위치를 활용해 사고를 유도하세요.
 - 예시: "직전 답변에서 언급한 [핵심 용어]와 연결해서 다시 생각해볼 수 있을까요?"
-- 예시: "[강의 자료의 특정 슬라이드]에서 강조한 조건이 여기에도 그대로 적용될까요?"
 - 예시: "한 단계 앞에서 정의했던 개념으로 돌아가면, 지금 빠진 조건은 무엇일까요?"
 
 4) 학생 답변 평가 정확도 강화:
@@ -204,7 +271,7 @@ C. 답변에 따른 대응 로직 (Response Logic)
 - 같은 수준의 질문을 반복하지 말고, 학생이 답할수록 질문의 사고 깊이를 한 단계씩 높이세요.
 - 이전 질문과 동일한 표현을 반복하지 말고, 반드시 새로운 관점이나 비교 상황을 포함하세요.
 - 동일한 격려나 권유(예: 다시 생각해보세요, 조금 더 고민해보세요)를 2회 이상 반복하지 마세요.
-- 학생이 두 번 이상 "모르겠다"고 할 경우, 이전보다 훨씬 더 구체적인 '키워드'나 '슬라이드 번호'를 언급하며 직접적인 힌트를 제공하세요.
+{dont_know_slide_rule}
 - "모르겠다"는 답변에 대해 단순히 다시 생각하라고 말하는 것은 금지하며, 반드시 사고의 출발점이 될 수 있는 자료 내의 구체적 사실을 한 가지 언급하세요.
 
 4. Output Format (출력 형식)
@@ -230,7 +297,7 @@ C. 답변에 따른 대응 로직 (Response Logic)
 
 [예시 3: 학생이 모르겠다고 할 때]
 > 학생: "잘 모르겠어요."
-> Qureka: 괜찮습니다. [슬라이드 4]를 보면 CPU의 사이클 타임과 IPC의 관계가 나오는데, 여기서 IPC가 고정되었을 때 성능을 높일 수 있는 다른 변수는 무엇이었나요?
+{example3}
 """
 
 def select_key_chunks(lecture_pages, max_pages=3, include_page_tag=True):
@@ -263,13 +330,19 @@ def select_key_chunks(lecture_pages, max_pages=3, include_page_tag=True):
 
     return result
 
-def generate_initial_question(lecture_pages, dept: str | None, grade: int | None, lecture_title: str) -> str:
+def generate_initial_question(
+    lecture_pages,
+    dept: str | None,
+    grade: int | None,
+    lecture_title: str,
+    source_kind: SourceKind = "pdf",
+) -> str:
     """강의 자료 확정 시 사용자의 학과/학년에 맞춘 첫 번째 질문 생성"""
     selected_text = select_key_chunks(
         lecture_pages,
-        include_page_tag=not is_audio
+        include_page_tag=(source_kind == "pdf"),
     )
-    system_prompt = get_qureka_system_prompt(dept, grade, lecture_title)
+    system_prompt = get_qureka_system_prompt(dept, grade, lecture_title, source_kind)
     prompt = f"""
     {system_prompt}
     
@@ -301,13 +374,19 @@ def generate_chat_response(
     dept: str | None,
     grade: int | None,
     lecture_title: str,
+    source_kind: SourceKind = "pdf",
 ) -> str:
     """학생의 답변에 따른 소크라테스식 꼬리 질문 생성"""
-    system_prompt = get_qureka_system_prompt(dept, grade, lecture_title)
+    system_prompt = get_qureka_system_prompt(dept, grade, lecture_title, source_kind)
+    context_heading = (
+        "[관련 전사 발췌]"
+        if source_kind == "transcript"
+        else "[참고 강의 내용]"
+    )
     prompt = f"""
     {system_prompt}
     
-    [참고 강의 내용]
+    {context_heading}
     {context_text}
     
     [이전 대화 기록]
@@ -370,6 +449,85 @@ def get_embeddings(text_list: List[str]):
         return [[random.uniform(-1, 1) for _ in range(3072)] for _ in text_list]
 
 
+def _clova_longspeech_extract_text(data: dict) -> str | None:
+    """
+    CLOVA Speech Long Sentence(sync) JSON에서 전체 텍스트 추출.
+    fullText가 비어 있어도 segments[].text / textEdited를 이어 붙입니다.
+    """
+    if not isinstance(data, dict):
+        return None
+    top = data.get("text")
+    if isinstance(top, str) and top.strip():
+        return top.strip()
+    segments = data.get("segments")
+    if not isinstance(segments, list):
+        return None
+    parts: List[str] = []
+    for seg in segments:
+        if not isinstance(seg, dict):
+            continue
+        frag = (seg.get("textEdited") or seg.get("text") or "").strip()
+        if frag:
+            parts.append(frag)
+    if not parts:
+        return None
+    return " ".join(parts)
+
+
+def _transcribe_ncp_csr_short(audio_path: str) -> str | None:
+    """
+    NCP CSR 단문 STT (바이너리 POST). 최대 약 60초 음성.
+    CLOVA Long Sentence가 본문을 주지 않을 때 선택 폴백.
+    """
+    cid = (
+        os.getenv("NCP_CSR_CLIENT_ID")
+        or os.getenv("NAVER_OPENAPI_CLIENT_ID")
+        or ""
+    ).strip()
+    csec = (
+        os.getenv("NCP_CSR_CLIENT_SECRET")
+        or os.getenv("NAVER_OPENAPI_CLIENT_SECRET")
+        or ""
+    ).strip()
+    if not cid or not csec:
+        return None
+    lang = (os.getenv("NCP_CSR_LANG") or "Kor").strip()
+    base = (
+        os.getenv("NCP_CSR_STT_URL")
+        or "https://naveropenapi.apigw.ntruss.com/recog/v1/stt"
+    ).rstrip("/")
+    url = f"{base}?lang={lang}"
+    headers = {
+        "X-NCP-APIGW-API-KEY-ID": cid,
+        "X-NCP-APIGW-API-KEY": csec,
+        "Content-Type": "application/octet-stream",
+    }
+    try:
+        with open(audio_path, "rb") as f:
+            raw = f.read()
+        r = requests.post(
+            url,
+            headers=headers,
+            data=raw,
+            timeout=int(os.getenv("NCP_CSR_TIMEOUT_SECONDS", "60")),
+        )
+        if r.status_code != 200:
+            print(f"NCP CSR STT HTTP {r.status_code}: {(r.text or '')[:500]}")
+            return None
+        try:
+            body = r.json()
+        except json.JSONDecodeError:
+            t = (r.text or "").strip()
+            return t or None
+        if isinstance(body, dict):
+            txt = body.get("text")
+            if isinstance(txt, str) and txt.strip():
+                return txt.strip()
+    except requests.RequestException as e:
+        print(f"NCP CSR STT 요청 실패: {e}")
+    return None
+
+
 def transcribe_audio(audio_path: str):
     print(f"--- Clova Speech 음성 인식 시작: {audio_path} ---")
 
@@ -387,39 +545,83 @@ def transcribe_audio(audio_path: str):
     request_body = {
         "language": "ko-KR",
         "completion": "sync",
-        "fullText": True
+        "fullText": True,
+        "wordAlignment": True,
+        "diarization": {"enable": False},
     }
 
     headers = {
         "Accept": "application/json",
-        "X-CLOVASPEECH-API-KEY": secret_key
+        "X-CLOVASPEECH-API-KEY": secret_key,
     }
+
+    ext = os.path.splitext(audio_path)[1].lower()
+    mime_map = {
+        ".mp3": "audio/mpeg",
+        ".wav": "audio/wav",
+        ".wave": "audio/wav",
+        ".m4a": "audio/mp4",
+        ".aac": "audio/aac",
+        ".flac": "audio/flac",
+        ".ogg": "audio/ogg",
+    }
+    guessed, _ = mimetypes.guess_type(audio_path)
+    content_type = (guessed or mime_map.get(ext) or "application/octet-stream")
+    media_name = os.path.basename(audio_path) or f"audio{ext or '.bin'}"
+
+    timeout = max(30, int(os.getenv("CLOVA_SPEECH_TIMEOUT_SECONDS", "180")))
 
     try:
         with open(audio_path, "rb") as f:
             files = {
-                "media": f,
-                "params": (
-                    None,
-                    json.dumps(request_body),
-                    "application/json"
-                )
+                "media": (media_name, f, content_type),
+                "params": (None, json.dumps(request_body, ensure_ascii=False), "application/json"),
             }
-
             response = requests.post(
                 url,
                 headers=headers,
                 files=files,
-                timeout=30
+                timeout=timeout,
             )
 
         response.raise_for_status()
 
-        result = response.json()
+        try:
+            data = response.json()
+        except json.JSONDecodeError:
+            snippet = (response.text or "")[:800]
+            return f"Clova Speech JSON 파싱 실패(HTTP {response.status_code}): {snippet}"
 
-        print(f"--- Clova Speech 추출 성공 ({audio_path}) ---")
+        if not isinstance(data, dict):
+            return f"Clova Speech 예상치 못한 응답 형식: {type(data).__name__}"
 
-        return result.get("text", "인식된 내용이 없습니다.")
+        result_code = str(data.get("result") or "").upper()
+        if result_code and result_code not in ("COMPLETED", "SUCCEEDED"):
+            msg = data.get("message") or ""
+            print(f"Clova Speech result={result_code}, message={msg}")
+
+        full_text = _clova_longspeech_extract_text(data)
+        if full_text:
+            print(f"--- Clova Speech 추출 성공 ({audio_path}) ---")
+            return full_text
+
+        fb = _transcribe_ncp_csr_short(audio_path)
+        if fb:
+            print(f"--- NCP CSR STT 폴백 성공 ({audio_path}) ---")
+            return fb
+
+        print(
+            "Clova Speech 응답(본문 없음, 일부 로그):",
+            json.dumps(data, ensure_ascii=False)[:2500],
+        )
+        msg = data.get("message") or result_code or "알 수 없음"
+        return (
+            "Clova Speech에서 인식 텍스트를 받지 못했습니다. "
+            f"(result={data.get('result')}, message={msg}) "
+            "음성 형식·길이·Invoke URL을 확인하세요. "
+            "단문(60초 이하) 대안으로 환경변수 NCP_CSR_CLIENT_ID, NCP_CSR_CLIENT_SECRET을 설정하면 "
+            "NCP CSR STT로 자동 재시도합니다."
+        )
 
     except requests.exceptions.Timeout:
         return "음성 인식 요청 시간이 초과되었습니다."
