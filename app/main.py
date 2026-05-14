@@ -22,6 +22,7 @@ def _upgrade_schema_postgres():
         return
     stmts = [
         "ALTER TABLE uploaded_files ADD COLUMN IF NOT EXISTS upload_group_id VARCHAR(64)",
+        "ALTER TABLE uploaded_files ADD COLUMN IF NOT EXISTS transcript_raw TEXT",
         "ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS source_kind VARCHAR(20)",
         "ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS upload_group_id VARCHAR(64)",
     ]

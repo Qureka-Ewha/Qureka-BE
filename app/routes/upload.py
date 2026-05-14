@@ -41,7 +41,12 @@ def extract_media_to_file_record(file_id: int):
                 )
             elif key.endswith((".mp3", ".wav", ".m4a")):
                 file_rec.page_text = None
-                file_rec.text_content = processing.transcribe_audio(path)
+                raw = processing.transcribe_audio(path)
+                file_rec.transcript_raw = raw
+                if processing.is_stt_service_error(raw):
+                    file_rec.text_content = raw
+                else:
+                    file_rec.text_content = None
             elif key.endswith(".txt"):
                 file_rec.page_text = None
                 file_rec.text_content = processing.read_uploaded_txt_file(path)
@@ -50,9 +55,68 @@ def extract_media_to_file_record(file_id: int):
                 file_rec.page_text = None
         except Exception as e:
             file_rec.page_text = None
+            file_rec.transcript_raw = None
             file_rec.text_content = f"[텍스트 추출 오류] {e}"
 
         db.commit()
+
+        if file_rec.upload_group_id and file_rec.lecture_id:
+            try_refine_audios_in_group(
+                file_rec.upload_group_id,
+                file_rec.lecture_id,
+            )
+    finally:
+        db.close()
+
+
+def _peer_reference_corpus(peers: List[models.UploadedFile]) -> str:
+    """묶음 내 음성이 아닌 파일 중, 추출에 성공한 본문만 합침 (STT 교정용)."""
+    parts: List[str] = []
+    for p in peers:
+        if processing.is_audio_file_url(p.file_url):
+            continue
+        tc = (p.text_content or "").strip()
+        if not tc or _looks_like_extraction_error(tc):
+            continue
+        name = p.original_name or "자료"
+        parts.append(f"=== {name} ===\n{tc}\n")
+    return "\n".join(parts).strip()
+
+
+def try_refine_audios_in_group(upload_group_id: str | None, lecture_id: int) -> None:
+    """강의 자료 텍스트가 준비된 뒤, 묶음 내 음성 STT를 자료 근거로만 교정해 text_content에 반영."""
+    if not upload_group_id:
+        return
+    db = SessionLocal()
+    try:
+        peers = (
+            db.query(models.UploadedFile)
+            .filter(
+                models.UploadedFile.lecture_id == lecture_id,
+                models.UploadedFile.upload_group_id == upload_group_id,
+            )
+            .order_by(models.UploadedFile.id.asc())
+            .all()
+        )
+        if not peers:
+            return
+        ref = _peer_reference_corpus(peers)
+        for p in peers:
+            if not processing.is_audio_file_url(p.file_url):
+                continue
+            db.refresh(p)
+            if p.text_content is not None:
+                continue
+            raw = (p.transcript_raw or "").strip()
+            if not raw or processing.is_stt_service_error(p.transcript_raw):
+                continue
+            if not ref:
+                p.text_content = raw
+                db.commit()
+                continue
+            refined = processing.refine_stt_with_lecture_docs(raw, ref)
+            p.text_content = refined if refined else raw
+            db.commit()
     finally:
         db.close()
 
@@ -211,6 +275,22 @@ async def upload_files(
 
     uid = current_user.id
 
+    def _orig_lower(uf: UploadFile) -> str:
+        return (os.path.basename(uf.filename or "") or "").lower()
+
+    has_audio = any(
+        _orig_lower(f).endswith((".mp3", ".wav", ".m4a")) for f in files
+    )
+    has_pdf = any(_orig_lower(f).endswith(".pdf") for f in files)
+    if has_audio and not has_pdf:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "음성 파일은 동일 요청에서 PDF 강의 자료를 함께 업로드해야 합니다. "
+                "STT 결과는 업로드한 강의 자료에만 근거하여 자동 교정된 뒤에 표시됩니다."
+            ),
+        )
+
     # 같은 강의명 있으면 재사용
     lecture = db.query(models.Lecture).filter(
         models.Lecture.title == lecture_title,
@@ -310,6 +390,8 @@ async def upload_files(
             result_entry["extracted_text"] = new_file.text_content
         uploaded_results.append(result_entry)
 
+    try_refine_audios_in_group(upload_group_id, lecture.id)
+
     return {
         "lecture_id": lecture.id,
         "user_id": uid,
@@ -340,12 +422,20 @@ def get_extraction_status(
         if pending
         else _looks_like_extraction_error(file_rec.text_content)
     )
+    is_audio = processing.is_audio_file_url(file_rec.file_url)
+    refinement_pending = bool(
+        is_audio
+        and pending
+        and (file_rec.transcript_raw or "").strip()
+        and not processing.is_stt_service_error(file_rec.transcript_raw)
+    )
     return {
         "file_id": file_id,
         "upload_group_id": file_rec.upload_group_id,
         "is_confirmed": file_rec.is_confirmed,
         "pending": pending,
         "failure": err,
+        "refinement_pending": refinement_pending,
         "extracted_text": None if pending else file_rec.text_content,
     }
 
@@ -381,6 +471,12 @@ def get_upload_batch_status(
                 "filename": f.original_name,
                 "extraction_pending": f.text_content is None,
                 "extraction_failure": _looks_like_extraction_error(f.text_content),
+                "refinement_pending": bool(
+                    processing.is_audio_file_url(f.file_url)
+                    and f.text_content is None
+                    and (f.transcript_raw or "").strip()
+                    and not processing.is_stt_service_error(f.transcript_raw)
+                ),
                 "is_confirmed": f.is_confirmed,
             }
             for f in files

@@ -38,8 +38,10 @@ class UploadedFile(Base):
     file_url = Column(String, nullable=False)
     file_type = Column(String, nullable=False)
     original_name = Column(String, nullable=True)
-    text_content = Column(Text, nullable=True) 
+    text_content = Column(Text, nullable=True)
     page_text = Column(Text, nullable=True)
+    # 음성: Clova STT 원문 (교정 전). 사용자에게는 text_content(교정본)만 노출.
+    transcript_raw = Column(Text, nullable=True)
     is_confirmed = Column(Boolean, default=False)
     # 동일 POST /upload 요청으로 올라온 파일 묶음 (다 파일 모두 검토 후 한 번에 튜터 시작)
     upload_group_id = Column(String(64), nullable=True, index=True)

@@ -631,3 +631,69 @@ def transcribe_audio(audio_path: str):
 
     except Exception as e:
         return f"음성 처리 중 오류 발생: {str(e)}"
+
+
+def is_stt_service_error(text: str | None) -> bool:
+    """Clova/STT 단계 실패 메시지면 True (교정 대상 아님)."""
+    if not text or not str(text).strip():
+        return True
+    s = str(text).strip()
+    prefixes = (
+        "오디오 파일이 존재하지",
+        "Clova Speech API 설정이 없습니다",
+        "음성 인식 요청 시간이 초과",
+        "Clova API 요청 오류",
+        "음성 처리 중 오류",
+        "Clova Speech에서 인식 텍스트를 받지 못했습니다",
+        "Clova Speech JSON 파싱 실패",
+        "Clova Speech 예상치 못한 응답",
+        "[텍스트 추출 오류]",
+    )
+    return any(s.startswith(p) for p in prefixes)
+
+
+def refine_stt_with_lecture_docs(stt_raw: str, reference_corpus: str) -> str:
+    """
+    강의 자료(참고 텍스트)만 근거로 STT 오인식을 보수. 새 내용 창작·할루시네이션 금지.
+    """
+    stt = (stt_raw or "").strip()
+    ref = (reference_corpus or "").strip()
+    if not stt:
+        return ""
+    if not ref:
+        return stt
+
+    max_ref = max(8000, int(os.getenv("STT_REFINE_REFERENCE_MAX_CHARS", "120000")))
+    if len(ref) > max_ref:
+        ref = ref[:max_ref] + "\n[... 이하 생략 ...]"
+
+    prompt = f"""당신은 STT(음성 인식) 전사 오류만 바로잡는 교정기입니다.
+
+[절대 규칙 — 위반 시 잘못된 응답]
+1. 출력은 "교정된 전사 텍스트" 한 덩어리만. 제목·설명·따옴표·불릿·메타 코멘트 금지.
+2. 아래 [강의 자료]에 없는 사실·개념·문장·수치를 새로 추가하지 마세요. 교수가 말했다고 지어낸 내용(할루시네이션) 금지.
+3. [STT 원문]에 없는 발화를 요약·추론·보완해서 넣지 마세요.
+4. [STT 원문]의 말 순서와 문단 흐름을 최대한 유지하세요.
+5. 단어만 강의 자료에 실제로 등장하는 표기·용어로 바꿀 수 있을 때만 바꾸세요. 근거가 애매하면 원문 유지.
+6. 강의 자료의 문장/단락을 그대로 복사해 전사에 끼워 넣지 마세요.
+7. 알아듣기 어려운 한 구간만 [들리지 않음]으로 표시할 수 있으나 남용 금지.
+8. 출력 길이는 STT 원문 길이의 약 80%~120% 범위를 넘지 마세요(불필요한 확장 금지).
+
+[강의 자료 — 참고·근거용. 이 텍스트를 인용해 전사를 대체하지 말 것]
+{ref}
+
+[STT 원문]
+{stt}
+"""
+    try:
+        response = client.models.generate_content(
+            model="models/gemini-2.5-flash",
+            contents=[prompt],
+            config=types.GenerateContentConfig(temperature=0.1),
+        )
+        out = getattr(response, "text", None) or ""
+        out = out.strip()
+        return out if out else stt
+    except Exception as e:
+        print(f"STT 교정(Gemini) 실패, 원문 유지: {e}")
+        return stt
