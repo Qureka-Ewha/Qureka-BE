@@ -252,6 +252,62 @@ def summarize_text(text):
         return text[:20]
 
 
+def _next_assistant_text(messages, idx: int) -> str:
+    for next_msg in messages[idx + 1:]:
+        if next_msg.get("role") == "assistant":
+            return next_msg.get("content") or ""
+    return ""
+
+
+def _classify_user_timeline_state(
+    messages,
+    idx: int,
+    suggested_type: str | None = None,
+    suggested_reason: str | None = None,
+):
+    text = messages[idx].get("content") or ""
+    next_ai = _next_assistant_text(messages, idx)
+    normalized_next_ai = re.sub(r"\s+", "", next_ai)
+
+    explicit_confusion = ["모르겠", "헷갈", "어려워", "몰라", "잘 모르", "이해 안"]
+    understanding_words = ["알겠", "이해했", "이해됐", "오케이", "맞아", "그렇군", "아하"]
+    negative_feedback = [
+        "아니요", "틀렸", "틀린", "맞지 않", "정확하지", "조금 달라",
+        "다시 생각", "혼동", "오해", "그건 아니", "아쉬", "보완",
+        "정확히는", "다만", "하지만", "좋은 시도", "가까워", "아니라",
+        "구분해야", "놓쳤", "부족", "정답은", "왜 그렇게 판단",
+        "어떤 점에서", "어떻게 다를", "모순", "충돌",
+    ]
+    positive_feedback_patterns = [
+        r"맞(아|아요|습니다|네요)[.!?]?",
+        r"정확(해|합니다|하게).*?(설명|이해|답)",
+        r"잘\s*(이해|설명|했)",
+        r"좋아요[.!?]?",
+        r"훌륭(해|합니다)",
+        r"그렇(죠|습니다)",
+        r"정답(입니다|이에요)",
+    ]
+    has_negative_feedback = any(word in next_ai for word in negative_feedback)
+    has_negative_feedback = has_negative_feedback or any(
+        word in normalized_next_ai
+        for word in ["맞지않", "정확하지않", "그건아니", "조금달라"]
+    )
+    has_positive_feedback = any(
+        re.search(pattern, next_ai)
+        for pattern in positive_feedback_patterns
+    )
+
+    if any(word in text for word in explicit_confusion):
+        return "confusion", "학습자가 모름/혼란을 직접 표현"
+    if has_negative_feedback:
+        return "confusion", "튜터 피드백상 답변 보완이 필요한 구간"
+    if has_positive_feedback or any(word in text for word in understanding_words):
+        return "understanding", "학습자가 개념을 정확히 이해한 구간"
+    if suggested_type in ("understanding", "confusion"):
+        return suggested_type, suggested_reason or TIMELINE_TYPE_META[suggested_type]["label"]
+    return "confusion", "정답 여부가 명확히 확인되지 않아 보완이 필요한 구간"
+
+
 def build_timeline(messages):
     timeline = []
 
@@ -263,25 +319,11 @@ def build_timeline(messages):
         if i == 0:
             state = "start"
             reason = "대화를 시작한 지점"
-        elif (
-            role == "user"
-            and elapsed is not None
-            and elapsed >= _LONG_RESPONSE_SECONDS
-        ):
-            state = "confusion"
-            reason = f"{elapsed}초 동안 답변을 고민한 구간"
-        elif any(word in text for word in ["모르겠", "헷갈", "어려워", "몰라"]):
-            state = "confusion"
-            reason = "학습자가 모름/혼란을 직접 표현"
-        elif any(word in text for word in ["잠깐", "음", "어...", "생각", "고민"]):
-            state = "hesitation"
-            reason = "답변을 망설이거나 오래 고민한 표현"
-        elif any(word in text for word in ["알겠", "이해", "오케이", "맞아", "네"]):
-            state = "understanding"
-            reason = "이해 또는 동의를 표현"
+        elif role == "user":
+            state, reason = _classify_user_timeline_state(messages, i)
         else:
             state = "progress"
-            reason = "개념을 탐색하며 학습 진행"
+            reason = "튜터가 질문 또는 피드백으로 학습을 진행"
 
         meta = TIMELINE_TYPE_META[state]
 
@@ -315,44 +357,45 @@ def build_timeline_with_gemini(messages):
 
 규칙:
 - 대화 원문 그대로 복사하지 말 것
-- 핵심 개념과 학습자의 이해 상태 중심으로 짧게 요약
-- text는 15자~30자 이내
+- AI 질문은 "무슨 질문이었는지", 학습자 답변은 "어떤 답변을 했는지" 중심으로 짧게 요약
+- text는 15자~35자 이내
 - reason은 왜 해당 이해 상태로 판단했는지 20자~45자 이내로 작성
 - role 유지
 - 입력 메시지 개수와 동일한 개수 반환
 - JSON 외 다른 설명 금지
 - type은 다음 중 하나:
-start, progress, hesitation, confusion, understanding
+start, progress, confusion, understanding
 - color는 type에 맞춰 반드시 아래 값 사용:
-  start=gray, progress=blue, hesitation=orange, confusion=red, understanding=green
+  start=gray, progress=blue, confusion=red, understanding=green
 - status는 아래 값 중 하나 사용:
-  학습 시작, 학습 진행, 답변 지연/고민, 취약/혼란, 이해 양호
-- severity는 취약도 점수입니다. start/understanding=0, progress=1, hesitation=2, confusion=3
-- 학습자가 "모르겠다", "헷갈린다", 틀린 추론을 반복하거나 튜터가 더 쉬운 힌트를 제공하는 구간은 confusion/red로 표시
-- prev_elapsed_seconds가 {_LONG_RESPONSE_SECONDS} 이상인 user 메시지는 오래 고민한 답변이므로 confusion/red로 표시
-- 학습자가 바로 답하지 못하고 "음", "잠깐", "생각", "고민"처럼 망설이지만 시간 지연이 길지 않은 구간은 hesitation/orange로 표시
-- 학습자가 개념을 맞게 설명하거나 이해를 표현하고 튜터가 긍정적으로 이어간 구간은 understanding/green으로 표시
+  학습 시작, 학습 진행, 취약/혼란, 이해 양호
+- severity는 취약도 점수입니다. start/understanding=0, progress=1, confusion=3
+- user 메시지만 understanding/confusion으로 분류하세요. assistant 메시지는 start 또는 progress로 분류하세요.
+- 학습자가 "모르겠다", "헷갈린다"처럼 모름을 직접 표현하거나, 다음 튜터 응답이 틀렸다고 교정하는 경우에만 confusion/red로 표시
+- 학습자가 개념을 맞게 설명하거나 다음 튜터 응답이 긍정적으로 인정하면 understanding/green으로 표시
+- 학습자 메시지에는 절대 start/progress/hesitation을 쓰지 마세요. 정답이면 understanding, 모르겠거나 오답이면 confusion입니다.
+- prev_elapsed_seconds는 정오 판단 근거가 아닙니다. 답변 시간보다 다음 튜터의 피드백과 개념적 정오를 우선하세요.
 
 반드시 JSON만 반환:
 
 [
   {{
-    "role": "user",
+    "role": "assistant",
     "type": "start",
     "status": "학습 시작",
     "color": "gray",
     "severity": 0,
-    "text": "운영체제의 정의를 질문",
-    "reason": "처음 다룬 핵심 주제"
+    "text": "운영체제 정의 질문",
+    "reason": "튜터가 첫 질문으로 학습을 시작"
   }},
   {{
-    "role": "assistant",
-    "type": "progress",
-    "status": "학습 진행",
-    "color": "blue",
-    "severity": 1,
-    "text": "자원 관리 역할 확인",
-    "reason": "개념 이해를 확인하는 질문"
+    "role": "user",
+    "type": "understanding",
+    "status": "이해 양호",
+    "color": "green",
+    "severity": 0,
+    "text": "자원 관리 역할로 답변",
+    "reason": "튜터가 다음 응답에서 정답으로 인정"
   }}
 ]
 """
@@ -369,19 +412,30 @@ start, progress, hesitation, confusion, understanding
         for idx, item in enumerate(timeline[:len(messages)]):
             if not isinstance(item, dict):
                 raise ValueError("timeline item must be object")
+            role = messages[idx]["role"]
             t = item.get("type")
             if t not in TIMELINE_TYPE_META:
                 t = "start" if idx == 0 else "progress"
+            if role == "user":
+                t, fallback_reason = _classify_user_timeline_state(
+                    messages,
+                    idx,
+                    suggested_type=t,
+                    suggested_reason=item.get("reason"),
+                )
+            else:
+                t = "start" if idx == 0 else "progress"
+                fallback_reason = "튜터가 질문 또는 피드백으로 학습을 진행"
             meta = TIMELINE_TYPE_META[t]
             elapsed = _elapsed_from_previous(messages, idx)
             normalized.append({
-                "role": item.get("role") or messages[idx]["role"],
+                "role": role,
                 "type": t,
                 "status": meta["label"],
                 "color": meta["color"],
                 "severity": meta["severity"],
                 "text": item.get("text") or summarize_text(messages[idx]["content"]),
-                "reason": item.get("reason") or meta["label"],
+                "reason": fallback_reason if role == "user" else item.get("reason") or fallback_reason,
                 "response_delay_seconds": elapsed,
             })
         if len(normalized) != len(messages):

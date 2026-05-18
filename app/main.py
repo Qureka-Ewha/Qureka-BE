@@ -27,6 +27,8 @@ def _upgrade_schema_postgres():
         "ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS upload_group_id VARCHAR(64)",
     ]
     with database.engine.begin() as conn:
+        conn.execute(text("SET lock_timeout = '2000ms'"))
+        conn.execute(text("SET statement_timeout = '5000ms'"))
         for s in stmts:
             try:
                 conn.execute(text(s))
@@ -72,6 +74,10 @@ _default_origins = [
     "http://127.0.0.1:3000",
     "http://localhost:5173",
     "http://127.0.0.1:5173",
+    "http://localhost:5174",
+    "http://127.0.0.1:5174",
+    "http://localhost:5175",
+    "http://127.0.0.1:5175",
 ]
 if _cors_origins_env and _cors_origins_env.strip():
     _allow_origins = [o.strip() for o in _cors_origins_env.split(",") if o.strip()]
@@ -95,6 +101,7 @@ def startup_event():
     서버가 시작될 때 데이터베이스에 필요한 기능을 활성화하고 테이블을 생성합니다.
     """
     with database.engine.connect() as conn:
+        conn.execute(text("SET statement_timeout = '5000ms'"))
         # 1) pgvector 확장 설치
         conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
         conn.commit()
