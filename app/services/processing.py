@@ -300,9 +300,32 @@ C. 답변에 따른 대응 로직 (Response Logic)
 {example3}
 """
 
+def _valid_slide_number(page_num) -> bool:
+    return isinstance(page_num, int) and page_num > 0
+
+
 def select_key_chunks(lecture_pages, max_pages=3, include_page_tag=True):
-    first_page = lecture_pages[0]   # 첫 페이지는 무조건 포함
-    others = lecture_pages[1:]
+    clean_pages = [
+        ((text or "").strip(), page_num)
+        for text, page_num in lecture_pages
+        if (text or "").strip()
+    ]
+    if not clean_pages:
+        return ""
+
+    if include_page_tag:
+        slide_pages = [
+            (text, page_num)
+            for text, page_num in clean_pages
+            if _valid_slide_number(page_num)
+        ]
+        # PDF 질문에서는 "슬라이드 None"이 생기지 않도록 실제 슬라이드 번호가 있는 페이지만 우선 사용.
+        pages_for_selection = slide_pages or clean_pages
+    else:
+        pages_for_selection = clean_pages
+
+    first_page = pages_for_selection[0]   # 첫 페이지는 무조건 포함
+    others = pages_for_selection[1:]
 
     scored = []
 
@@ -319,7 +342,7 @@ def select_key_chunks(lecture_pages, max_pages=3, include_page_tag=True):
 
     if include_page_tag:
         result = "\n".join([
-            f"[슬라이드 {page_num}]\n{text}"
+            f"[슬라이드 {page_num}]\n{text}" if _valid_slide_number(page_num) else text
             for text, page_num in selected
         ])
     else:
@@ -329,6 +352,29 @@ def select_key_chunks(lecture_pages, max_pages=3, include_page_tag=True):
         ])
 
     return result
+
+
+def _extract_initial_question_topic(selected_text: str, lecture_title: str) -> str:
+    text_without_tags = re.sub(r"\[슬라이드\s+\d+\]", " ", selected_text or "")
+    key_terms = re.findall(r"[가-힣A-Za-z][가-힣A-Za-z0-9_-]{1,}", text_without_tags)
+    stop = {
+        "그리고", "하지만", "있는", "없는", "것은", "것이", "이를",
+        "에서", "으로", "한다", "합니다", "자료", "강의", "슬라이드",
+        "None", "none", "NULL", "null", "입니다", "습니다", "대한",
+    }
+    candidates = [
+        term
+        for term in key_terms
+        if term not in stop and term.lower() not in ("none", "null")
+    ]
+    return candidates[0] if candidates else (lecture_title or "핵심 개념")
+
+
+def _first_valid_slide_number(lecture_pages) -> int | None:
+    for _, page_num in lecture_pages:
+        if _valid_slide_number(page_num):
+            return page_num
+    return None
 
 def generate_initial_question(
     lecture_pages,
@@ -342,6 +388,20 @@ def generate_initial_question(
         lecture_pages,
         include_page_tag=(source_kind == "pdf"),
     )
+    if os.getenv("INITIAL_QUESTION_USE_GEMINI", "").lower() not in ("1", "true", "yes"):
+        topic = _extract_initial_question_topic(selected_text, lecture_title)
+        slide_number = _first_valid_slide_number(lecture_pages)
+        if source_kind == "pdf" and slide_number is not None:
+            source_phrase = f"슬라이드 {slide_number}에서"
+        elif source_kind == "transcript":
+            source_phrase = "녹음 자료에서"
+        else:
+            source_phrase = "강의 자료에서"
+        return (
+            f"{source_phrase} 먼저 '{topic}' 개념을 짚어볼게요. "
+            f"'{topic}'이 어떤 의미이고 왜 중요한지 설명해볼 수 있나요?"
+        )
+
     system_prompt = get_qureka_system_prompt(dept, grade, lecture_title, source_kind)
     prompt = f"""
     {system_prompt}
@@ -350,6 +410,8 @@ def generate_initial_question(
     {selected_text}
 
     위 강의 자료를 바탕으로 학생의 이해도를 점검할 수 있는 심도 있는 첫 질문을 생성하세요.
+    PDF 슬라이드 번호는 실제 [슬라이드 N] 태그가 있을 때만 언급하고, 절대로 "슬라이드 None" 또는 "None 개념"이라고 말하지 마세요.
+    녹음/전사 자료에는 슬라이드 번호를 붙이지 말고 "녹음 자료"라고만 표현하세요.
     태그 없이 질문만 자연스럽게 출력하세요.
     """
     
