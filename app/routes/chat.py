@@ -1,6 +1,7 @@
-from fastapi import APIRouter, Depends, HTTPException, Form
+from fastapi import APIRouter, Depends, HTTPException, Form, status
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from ..database import get_db
 from .. import models, auth, database
 from ..services import processing
@@ -288,3 +289,42 @@ def update_session_title(
     db.commit()
 
     return {"message": "대화방 이름이 성공적으로 변경되었습니다.", "title": title}
+
+
+# ---------------------------------------------------------
+# 5️⃣ 대화 세션 삭제
+# ---------------------------------------------------------
+@router.delete("/sessions/{session_id}", status_code=status.HTTP_200_OK)
+def delete_session(
+    session_id: int,
+    db: Session = Depends(database.get_db),
+    current_user: models.User = Depends(auth.get_current_user)
+):
+    session = (
+        db.query(models.ChatSession)
+        .options(joinedload(models.ChatSession.lecture))
+        .filter(models.ChatSession.id == session_id)
+        .first()
+    )
+
+    if not session:
+        raise HTTPException(status_code=404, detail="대화방을 찾을 수 없습니다.")
+
+    if session.lecture.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="접근 권한이 없습니다.")
+
+    try:
+        # 기존 DB의 FK가 CASCADE로 반영되지 않은 환경에서도 안전하게 삭제합니다.
+        db.query(models.ChatMessage).filter(
+            models.ChatMessage.session_id == session_id
+        ).delete(synchronize_session=False)
+        db.delete(session)
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="대화방에 연결된 데이터를 삭제하는 중 충돌이 발생했습니다."
+        )
+
+    return {"message": "대화방이 성공적으로 삭제되었습니다.", "session_id": session_id}

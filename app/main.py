@@ -58,6 +58,24 @@ def _upgrade_schema_postgres():
             )
         except Exception as e:
             print(f"[schema] add file_id fk: {e}")
+        try:
+            conn.execute(
+                text(
+                    "ALTER TABLE chat_messages DROP CONSTRAINT IF EXISTS "
+                    "chat_messages_session_id_fkey"
+                )
+            )
+        except Exception as e:
+            print(f"[schema] drop message session fk: {e}")
+        try:
+            conn.execute(
+                text(
+                    "ALTER TABLE chat_messages ADD CONSTRAINT chat_messages_session_id_fkey "
+                    "FOREIGN KEY (session_id) REFERENCES chat_sessions(id) ON DELETE CASCADE"
+                )
+            )
+        except Exception as e:
+            print(f"[schema] add message session fk: {e}")
 
 app = FastAPI(title="Qureka Unified Server")
 app.mount(
