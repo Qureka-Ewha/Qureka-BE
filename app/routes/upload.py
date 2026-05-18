@@ -79,8 +79,30 @@ def _peer_reference_corpus(peers: List[models.UploadedFile]) -> str:
         if not tc or _looks_like_extraction_error(tc):
             continue
         name = p.original_name or "자료"
+        if p.file_url.lower().endswith(".pdf") and p.page_text:
+            try:
+                pages = json.loads(p.page_text)
+                page_body = "\n".join(
+                    f"[슬라이드 {item.get('page')}] {(item.get('text') or '').strip()}"
+                    for item in pages
+                    if (item.get("text") or "").strip()
+                ).strip()
+                if page_body:
+                    parts.append(f"=== {name} ===\n{page_body}\n")
+                    continue
+            except (json.JSONDecodeError, TypeError, AttributeError):
+                pass
         parts.append(f"=== {name} ===\n{tc}\n")
     return "\n".join(parts).strip()
+
+
+def _has_pending_reference_file(peers: List[models.UploadedFile]) -> bool:
+    """STT 교정 기준이 될 PDF/txt 자료 추출이 아직 끝나지 않았는지 확인."""
+    return any(
+        not processing.is_audio_file_url(p.file_url)
+        and p.text_content is None
+        for p in peers
+    )
 
 
 def try_refine_audios_in_group(upload_group_id: str | None, lecture_id: int) -> None:
@@ -101,6 +123,11 @@ def try_refine_audios_in_group(upload_group_id: str | None, lecture_id: int) -> 
         if not peers:
             return
         ref = _peer_reference_corpus(peers)
+        reference_pending = _has_pending_reference_file(peers)
+        has_reference_file = any(
+            not processing.is_audio_file_url(p.file_url)
+            for p in peers
+        )
         for p in peers:
             if not processing.is_audio_file_url(p.file_url):
                 continue
@@ -111,6 +138,15 @@ def try_refine_audios_in_group(upload_group_id: str | None, lecture_id: int) -> 
             if not raw or processing.is_stt_service_error(p.transcript_raw):
                 continue
             if not ref:
+                if reference_pending:
+                    continue
+                if has_reference_file:
+                    p.text_content = (
+                        "[텍스트 추출 오류] PDF 강의 자료 텍스트가 없어 "
+                        "음성 STT를 교정할 수 없습니다."
+                    )
+                    db.commit()
+                    continue
                 p.text_content = raw
                 db.commit()
                 continue

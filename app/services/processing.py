@@ -697,3 +697,65 @@ def refine_stt_with_lecture_docs(stt_raw: str, reference_corpus: str) -> str:
     except Exception as e:
         print(f"STT 교정(Gemini) 실패, 원문 유지: {e}")
         return stt
+
+def process_lecture_materials(
+    pdf_bytes: bytes | None = None, 
+    audio_path: str | None = None,
+    dept: str | None = None,
+    grade: int | None = None,
+    lecture_title: str = "미지정 강의"
+) -> dict:
+    """
+    PDF 자료와 음성 파일이 함께 업로드되었을 때 
+    순서를 보장하여 처리하는 마스터 파이프라인 함수
+    """
+    pdf_text_inside = ""
+    transcript_raw = ""
+    transcript_refined = ""
+    source_kind: SourceKind = "pdf"
+
+    # 1단계: PDF 추출을 무조건 '먼저' 수행 (교정의 기준 정립)
+    if pdf_bytes:
+        print("▶ [1단계] PDF 텍스트 추출 시작")
+        pdf_pages = extract_from_pdf(pdf_bytes)
+        
+        # 교정기(refine_stt_with_lecture_docs)에 통째로 넣기 위해 하나의 텍스트로 합침
+        pdf_text_inside = "\n".join([f"[슬라이드 {pn}] {txt}" for txt, pn in pdf_pages])
+        print(f"▶ [1단계] PDF 추출 완료 (총 {len(pdf_pages)}페이지 분량 코퍼스 확보)")
+
+    # 2단계: 음성 파일 STT 추출 진행
+    if audio_path and os.path.exists(audio_path):
+        print("▶ [2단계] 음성 파일 STT 추출 시작")
+        transcript_raw = transcribe_audio(audio_path)
+        
+        # Clova Speech 에러 메시지인지 검증
+        if is_stt_service_error(transcript_raw):
+            print(f"STT 서비스 오류 발생: {transcript_raw}")
+            transcript_refined = transcript_raw
+        else:
+            print("▶ [2단계] 음성 파일 STT 추출 성공")
+            
+            # 3단계: PDF 텍스트가 존재한다면 이를 바탕으로 음성 텍스트 '교정' 진행
+            if pdf_text_inside:
+                print("▶ [3단계] PDF 자료를 기반으로 STT 오인식 교정 시작")
+                transcript_refined = refine_stt_with_lecture_docs(
+                    stt_raw=transcript_raw, 
+                    reference_corpus=pdf_text_inside
+                )
+                print("▶ [3단계] STT 교정 완료")
+            else:
+                transcript_refined = transcript_raw
+                source_kind = "transcript"
+                
+    # [보완] 음성 파일이 아예 안 들어왔거나, 들어왔더라도 STT 서비스 자체에 실패한 경우
+    if not transcript_refined and pdf_text_inside:
+        source_kind = "pdf"
+        transcript_refined = pdf_text_inside
+
+    # 최종 결과 반환
+    return {
+        "source_kind": source_kind,
+        "pdf_corpus": pdf_text_inside,          # 교정의 기준이 된 PDF 텍스트
+        "transcript_raw": transcript_raw,      # 교정 전 순수 STT 결과
+        "transcript_refined": transcript_refined # 최종 교정 완료된 결과
+    }
