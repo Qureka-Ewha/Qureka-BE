@@ -9,12 +9,14 @@ import shutil
 import os
 import json
 import uuid
+import threading
 
 router = APIRouter()
 
 # 업로드 경로 설정
 UPLOAD_DIR = "uploaded_files"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+STT_REFINE_ENABLED = os.getenv("STT_REFINE_ENABLED", "").lower() in ("1", "true", "yes")
 
 # ---------------------------------------------------------
 # 업로드 직후: 디스크에 저장만 한 뒤 텍스트/페이지를 백그라운드에서 채움
@@ -45,8 +47,12 @@ def extract_media_to_file_record(file_id: int):
                 file_rec.transcript_raw = raw
                 if processing.is_stt_service_error(raw):
                     file_rec.text_content = raw
-                else:
+                elif STT_REFINE_ENABLED:
+                    # Optional slower path: wait for lecture-material-based STT refinement.
+                    # Default is disabled so users can review raw STT as soon as it is ready.
                     file_rec.text_content = None
+                else:
+                    file_rec.text_content = raw
             elif key.endswith(".txt"):
                 file_rec.page_text = None
                 file_rec.text_content = processing.read_uploaded_txt_file(path)
@@ -60,7 +66,7 @@ def extract_media_to_file_record(file_id: int):
 
         db.commit()
 
-        if file_rec.upload_group_id and file_rec.lecture_id:
+        if STT_REFINE_ENABLED and file_rec.upload_group_id and file_rec.lecture_id:
             try_refine_audios_in_group(
                 file_rec.upload_group_id,
                 file_rec.lecture_id,
@@ -257,7 +263,8 @@ def build_combined_lecture_pages(
                     t = (item.get("text") or "").strip()
                     if not t:
                         continue
-                    pages.append((t, page_counter))
+                    page_num = item.get("page")
+                    pages.append((t, page_num if isinstance(page_num, int) and page_num > 0 else page_counter))
                     page_counter += 1
                     added_pages += 1
                 if added_pages > 0:
@@ -407,10 +414,11 @@ async def upload_files(
                 extraction_pending = False
             print(f"txt 즉시 로드(file_id={new_file.id}): {orig_name}")
         else:
-            background_tasks.add_task(
-                extract_media_to_file_record,
-                new_file.id,
-            )
+            threading.Thread(
+                target=extract_media_to_file_record,
+                args=(new_file.id,),
+                daemon=True,
+            ).start()
             extraction_pending = True
             print(
                 f"업로드 수신 후 백그라운드 추출 예약(file_id={new_file.id}): {orig_name}"
@@ -426,7 +434,8 @@ async def upload_files(
             result_entry["extracted_text"] = new_file.text_content
         uploaded_results.append(result_entry)
 
-    try_refine_audios_in_group(upload_group_id, lecture.id)
+    if STT_REFINE_ENABLED:
+        try_refine_audios_in_group(upload_group_id, lecture.id)
 
     return {
         "lecture_id": lecture.id,

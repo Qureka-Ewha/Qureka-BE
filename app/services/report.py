@@ -11,6 +11,7 @@ load_dotenv()
 _client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 _GEMINI_MODEL = "models/gemini-2.5-flash"
 _LONG_RESPONSE_SECONDS = int(os.getenv("REPORT_LONG_RESPONSE_SECONDS", "90"))
+_REPORT_USE_GEMINI = os.getenv("REPORT_USE_GEMINI", "").lower() in ("1", "true", "yes")
 
 
 def _generation_text(resp) -> str:
@@ -242,14 +243,11 @@ def build_tree_with_gemini(messages, concept_freq):
 
 
 def summarize_text(text):
-    if "?" in text or "뭐" in text or "왜" in text:
-        return "핵심 개념 질문"
-    elif any(word in text for word in ["설명", "역할", "정의"]):
-        return "개념 설명 요청"
-    elif any(word in text for word in ["차이", "비교"]):
-        return "개념 비교 질문"
-    else:
-        return text[:20]
+    compact = re.sub(r"\s+", " ", (text or "").strip())
+    if not compact:
+        return "내용 없음"
+    suffix = "..." if len(compact) > 34 else ""
+    return compact[:34] + suffix
 
 
 def _next_assistant_text(messages, idx: int) -> str:
@@ -450,9 +448,15 @@ def generate_learning_report(messages):
 
     concept_freq = Counter(words)
 
-    tree_result = build_tree_with_gemini(messages, concept_freq)
-
-    timeline = build_timeline_with_gemini(messages)
+    if _REPORT_USE_GEMINI:
+        tree_result = build_tree_with_gemini(messages, concept_freq)
+        timeline = build_timeline_with_gemini(messages)
+    else:
+        tree_result = {
+            "tree": build_tree(messages, concept_freq),
+            "mindmap": build_detailed_tree(messages, concept_freq),
+        }
+        timeline = build_timeline(messages)
 
     return {
         "concept_frequency": dict(concept_freq.most_common(10)),
