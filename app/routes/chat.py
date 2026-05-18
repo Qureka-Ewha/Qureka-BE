@@ -34,6 +34,33 @@ def _session_source_kind(session: models.ChatSession, db: Session) -> processing
     return "pdf"
 
 
+def _session_files(session: models.ChatSession):
+    if not session.lecture or not session.lecture.files:
+        return []
+
+    if session.upload_group_id:
+        return [
+            f
+            for f in session.lecture.files
+            if f.upload_group_id == session.upload_group_id
+        ]
+
+    if session.file_id:
+        return [f for f in session.lecture.files if f.id == session.file_id]
+
+    return session.lecture.files
+
+
+def _file_payload(file: models.UploadedFile):
+    return {
+        "file_id": file.id,
+        "file_name": file.original_name,
+        "file_type": file.file_type,
+        "file_url": f"/uploaded_files/{os.path.basename(file.file_url)}",
+        "is_confirmed": file.is_confirmed,
+    }
+
+
 # ---------------------------------------------------------
 # 1️⃣ AI 튜터와 대화하기
 # ---------------------------------------------------------
@@ -154,16 +181,24 @@ def get_chat_sessions(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(auth.get_current_user)
 ):
-    sessions = db.query(models.ChatSession).join(models.Lecture).filter(
-        models.Lecture.user_id == current_user.id
-    ).order_by(models.ChatSession.created_at.desc()).all()
+    sessions = (
+        db.query(models.ChatSession)
+        .options(
+            joinedload(models.ChatSession.lecture).joinedload(models.Lecture.files)
+        )
+        .join(models.Lecture)
+        .filter(models.Lecture.user_id == current_user.id)
+        .order_by(models.ChatSession.created_at.desc())
+        .all()
+    )
 
     return [
         {
             "session_id": s.id,
             "title": s.title,
             "lecture_id": s.lecture_id,
-            "created_at": s.created_at
+            "created_at": s.created_at,
+            "files": [_file_payload(f) for f in _session_files(s)],
         }
         for s in sessions
     ]
@@ -215,16 +250,7 @@ def get_chat_history(
         "upload_group_id": session.upload_group_id,
         "linked_file_id": session.file_id,
 
-        "files": [
-            {
-                "file_id": f.id,
-                "file_name": f.original_name,
-                "file_type": f.file_type,
-                "file_url": f"/uploaded_files/{os.path.basename(f.file_url)}",
-                "is_confirmed": f.is_confirmed,
-            }
-            for f in session.lecture.files
-        ],
+        "files": [_file_payload(f) for f in _session_files(session)],
 
         "messages": [
             {
