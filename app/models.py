@@ -37,9 +37,14 @@ class UploadedFile(Base):
     lecture_id = Column(Integer, ForeignKey("lectures.id", ondelete="CASCADE"))
     file_url = Column(String, nullable=False)
     file_type = Column(String, nullable=False)
-    text_content = Column(Text, nullable=True) 
+    original_name = Column(String, nullable=True)
+    text_content = Column(Text, nullable=True)
     page_text = Column(Text, nullable=True)
+    # 음성: Clova STT 원문 (교정 전). 사용자에게는 text_content(교정본)만 노출.
+    transcript_raw = Column(Text, nullable=True)
     is_confirmed = Column(Boolean, default=False)
+    # 동일 POST /upload 요청으로 올라온 파일 묶음 (다 파일 모두 검토 후 한 번에 튜터 시작)
+    upload_group_id = Column(String(64), nullable=True, index=True)
 
     lecture = relationship("Lecture", back_populates="files")
     chunks = relationship("LectureChunk", back_populates="file", cascade="all, delete-orphan")
@@ -71,8 +76,16 @@ class ChatSession(Base):
 
     id = Column(Integer, primary_key=True)
     lecture_id = Column(Integer, ForeignKey("lectures.id", ondelete="CASCADE"))
-    file_id = Column(Integer, ForeignKey("uploaded_files.id", ondelete="CASCADE"))
+    file_id = Column(
+        Integer,
+        ForeignKey("uploaded_files.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     title = Column(String, nullable=False)
+    # 다중 파일 세션: 튜터 모드 고정 (pdf | transcript)
+    source_kind = Column(String(20), nullable=True)
+    # 묶음 업로드 완료 후 생성된 세션 식별·멱등 응답용
+    upload_group_id = Column(String(64), nullable=True, index=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     lecture = relationship("Lecture", back_populates="chat_sessions")

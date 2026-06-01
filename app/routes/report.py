@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from ..database import get_db
 from .. import models, auth
@@ -16,9 +16,12 @@ def get_learning_report(
 ):
 
     # 1. 세션 조회
-    session = db.query(models.ChatSession).filter(
-        models.ChatSession.id == session_id
-    ).first()
+    session = (
+        db.query(models.ChatSession)
+        .options(joinedload(models.ChatSession.lecture))
+        .filter(models.ChatSession.id == session_id)
+        .first()
+    )
 
     if not session:
         raise HTTPException(
@@ -33,18 +36,19 @@ def get_learning_report(
             detail="접근 권한이 없습니다."
         )
 
-    # 3. 사용자 질문만 조회
+    # 3. 리포트 생성을 위한 전체 대화 조회
     messages = db.query(models.ChatMessage).filter(
         models.ChatMessage.session_id == session_id
     ).order_by(models.ChatMessage.id).all()
 
-    # 4. role 포함 대화 기록 구성
+    # 4. role과 응답 지연 계산용 시간 정보 포함
     chat_history = [
-    {
-        "role": m.role,
-        "content": m.content
-    }
-    for m in messages
+        {
+            "role": m.role,
+            "content": m.content,
+            "created_at": m.created_at.isoformat() if m.created_at else None,
+        }
+        for m in messages
     ]
 
     # 5. 리포트 생성
