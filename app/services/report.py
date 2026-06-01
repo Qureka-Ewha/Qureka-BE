@@ -6,12 +6,15 @@ from collections import Counter
 from datetime import datetime
 import re
 
+from app.services import academic_concepts as ac
+
 load_dotenv()
 
 _client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 _GEMINI_MODEL = "models/gemini-2.5-flash"
 _LONG_RESPONSE_SECONDS = int(os.getenv("REPORT_LONG_RESPONSE_SECONDS", "90"))
 _REPORT_USE_GEMINI = os.getenv("REPORT_USE_GEMINI", "").lower() in ("1", "true", "yes")
+_TIMELINE_USE_GEMINI = os.getenv("TIMELINE_USE_GEMINI", "true").lower() in ("1", "true", "yes")
 
 
 def _generation_text(resp) -> str:
@@ -20,15 +23,6 @@ def _generation_text(resp) -> str:
         return (t or "").strip()
     except Exception:
         return ""
-
-# 너무 흔한 단어 제거
-STOPWORDS = {
-    "그리고", "하지만", "그러면", "이건", "그건", "있다", "없다",
-    "하는", "이다", "입니다", "잘", "너무", "좀", "그", "저", "것",
-    "에서", "으로", "하는데", "모르겠어", "설명", "차이", "통해",
-    "이해", "알겠", "모르겠", "헷갈", "어려워", "같아", "대해"
-}
-
 
 TIMELINE_TYPE_META = {
     "start": {
@@ -96,27 +90,28 @@ def _elapsed_from_previous(messages, idx: int) -> int | None:
 
 
 def extract_keywords(messages):
+    """대화 전체에서 전공 학술 명사/명사구만 추출 (단어 단위 분할 금지)."""
     words = []
-
     for msg in messages:
-        if msg["role"] != "user":
-            continue
-
-        text = msg["content"]
-        tokens = re.findall(r"[가-힣A-Za-z]+", text)
-
-        for token in tokens:
-            if len(token) >= 2 and token not in STOPWORDS:
-                words.append(token)
-
+        content = msg.get("content") or ""
+        for phrase, _ in ac.extract_academic_noun_phrases(content):
+            words.append(phrase)
     return words
 
 
+def _filter_concept_freq(concept_freq: Counter) -> Counter:
+    filtered = Counter()
+    for term, count in concept_freq.items():
+        if ac.is_valid_academic_phrase(term):
+            filtered[term] += count
+    return filtered
+
+
 def build_tree(messages, concept_freq):
+    concept_freq = _filter_concept_freq(concept_freq)
     if not concept_freq:
         return {}
 
-    # 가장 많이 등장한 핵심 개념 1개 선택
     main_concept = concept_freq.most_common(1)[0][0]
 
     # 상위 관련 개념 8개 추출 (main 제외)
@@ -132,6 +127,7 @@ def build_tree(messages, concept_freq):
 
 def build_detailed_tree(messages, concept_freq):
     """Gemini 실패 시에도 프론트가 풍부한 마인드맵을 그릴 수 있는 기본 구조."""
+    concept_freq = _filter_concept_freq(concept_freq)
     if not concept_freq:
         return {"root": "", "nodes": [], "edges": []}
 
@@ -169,6 +165,7 @@ def build_detailed_tree(messages, concept_freq):
     }
 
 def build_tree_with_gemini(messages, concept_freq):
+    concept_freq = _filter_concept_freq(concept_freq)
     if not concept_freq:
         return {"tree": {}, "mindmap": {"root": "", "nodes": [], "edges": []}}
 
@@ -177,17 +174,24 @@ def build_tree_with_gemini(messages, concept_freq):
         for m in messages
     ])
 
+    suggested = ", ".join(word for word, _ in concept_freq.most_common(15))
+
     prompt = f"""
 다음은 학생과 AI 튜터의 대화입니다.
 
 {chat_text}
+
+{ac.mindmap_keyword_prompt_block()}
+
+[추출 후보 참고 — 아래는 시스템이 선별한 학술 명사구입니다. 이 외 메타 단어·동사는 넣지 마세요]
+{suggested}
 
 목표:
 - 프론트에서 마인드맵으로 시각화할 수 있도록 핵심 개념을 충분히 구조화하세요.
 - 단순 키워드 나열이 아니라, 중심 개념 → 주요 하위 개념 → 세부 개념의 관계가 드러나야 합니다.
 
 규칙:
-- 학생이 실제로 고민하거나 답한 내용을 중심으로 판단하세요.
+- 학생이 실제로 고민하거나 답한 내용과 강의에서 학습한 기술 개념을 중심으로 판단하세요.
 - 중심 개념 1개, 주요 하위 개념 4~7개, 필요 시 세부 개념 1~3개씩 포함하세요.
 - nodes는 8~18개 정도로 구성하세요. 대화가 짧으면 가능한 범위에서만 작성하세요.
 - weight는 대화에서의 중요도/빈도를 1~5 정수로 표시하세요.
@@ -243,11 +247,29 @@ def build_tree_with_gemini(messages, concept_freq):
 
 
 def summarize_text(text):
-    compact = re.sub(r"\s+", " ", (text or "").strip())
+    return _summarize_timeline_message("user", text)
+
+
+def _summarize_timeline_message(role: str, content: str) -> str:
+    compact = re.sub(r"\s+", " ", (content or "").strip())
     if not compact:
         return "내용 없음"
-    suffix = "..." if len(compact) > 34 else ""
-    return compact[:34] + suffix
+
+    if role == "assistant":
+        for sep in ("?", "？"):
+            if sep in compact:
+                question = compact.split(sep)[0].strip() + sep
+                return question[:35] + ("..." if len(question) > 35 else "")
+        return compact[:35] + ("..." if len(compact) > 35 else "")
+
+    return compact[:35] + ("..." if len(compact) > 35 else "")
+
+
+def _previous_assistant_text(messages, idx: int) -> str:
+    for j in range(idx - 1, -1, -1):
+        if messages[j].get("role") == "assistant":
+            return messages[j].get("content") or ""
+    return ""
 
 
 def _next_assistant_text(messages, idx: int) -> str:
@@ -255,6 +277,43 @@ def _next_assistant_text(messages, idx: int) -> str:
         if next_msg.get("role") == "assistant":
             return next_msg.get("content") or ""
     return ""
+
+
+def _ai_feedback_is_positive(next_ai: str) -> bool:
+    if not next_ai.strip():
+        return False
+    head = next_ai[:160]
+    positive_patterns = [
+        r"^맞(아|아요|습니다|네요)",
+        r"^정확(합니다|해요|하게|한)",
+        r"^좋(습니다|아요|은\s)",
+        r"^훌륭",
+        r"^그렇(습니다|죠|네요)",
+        r"^잘\s*(이해|설명|했)",
+        r"^네[,.\s]",
+    ]
+    return any(re.search(pattern, head) for pattern in positive_patterns)
+
+
+def _ai_feedback_is_negative(next_ai: str) -> bool:
+    if not next_ai.strip():
+        return False
+
+    normalized = re.sub(r"\s+", "", next_ai)
+    strong_negative = [
+        "틀렸", "틀린", "맞지않", "정확하지않", "오해하고", "오해하신",
+        "그건아니", "아니에요", "아닙니다", "잘못", "다시생각해보",
+        "다시생각해", "모르겠다고", "헷갈리", "어렵다고",
+    ]
+    if any(token in normalized for token in strong_negative):
+        return True
+
+    # 심화 질문용 접속어(정확히는/하지만)만으로는 오답 처리하지 않음
+    if _ai_feedback_is_positive(next_ai):
+        return False
+
+    soft_negative = ["다시 생각", "혼동", "보완", "놓쳤", "부족", "정답은"]
+    return any(word in next_ai for word in soft_negative)
 
 
 def _classify_user_timeline_state(
@@ -265,48 +324,92 @@ def _classify_user_timeline_state(
 ):
     text = messages[idx].get("content") or ""
     next_ai = _next_assistant_text(messages, idx)
-    normalized_next_ai = re.sub(r"\s+", "", next_ai)
 
-    explicit_confusion = ["모르겠", "헷갈", "어려워", "몰라", "잘 모르", "이해 안"]
-    understanding_words = ["알겠", "이해했", "이해됐", "오케이", "맞아", "그렇군", "아하"]
-    negative_feedback = [
-        "아니요", "틀렸", "틀린", "맞지 않", "정확하지", "조금 달라",
-        "다시 생각", "혼동", "오해", "그건 아니", "아쉬", "보완",
-        "정확히는", "다만", "하지만", "좋은 시도", "가까워", "아니라",
-        "구분해야", "놓쳤", "부족", "정답은", "왜 그렇게 판단",
-        "어떤 점에서", "어떻게 다를", "모순", "충돌",
-    ]
-    positive_feedback_patterns = [
-        r"맞(아|아요|습니다|네요)[.!?]?",
-        r"정확(해|합니다|하게).*?(설명|이해|답)",
-        r"잘\s*(이해|설명|했)",
-        r"좋아요[.!?]?",
-        r"훌륭(해|합니다)",
-        r"그렇(죠|습니다)",
-        r"정답(입니다|이에요)",
-    ]
-    has_negative_feedback = any(word in next_ai for word in negative_feedback)
-    has_negative_feedback = has_negative_feedback or any(
-        word in normalized_next_ai
-        for word in ["맞지않", "정확하지않", "그건아니", "조금달라"]
-    )
-    has_positive_feedback = any(
-        re.search(pattern, next_ai)
-        for pattern in positive_feedback_patterns
-    )
+    explicit_confusion = ["모르겠", "헷갈", "어려워", "몰라", "잘 모르", "이해 안", "모르겠어"]
+    understanding_words = ["알겠", "이해했", "이해됐", "오케이", "맞아", "그렇군", "아하", "이해합니다"]
 
     if any(word in text for word in explicit_confusion):
         return "confusion", "학습자가 모름/혼란을 직접 표현"
-    if has_negative_feedback:
+    if _ai_feedback_is_positive(next_ai):
+        return "understanding", "튜터가 정답으로 인정한 구간"
+    if _ai_feedback_is_negative(next_ai):
         return "confusion", "튜터 피드백상 답변 보완이 필요한 구간"
-    if has_positive_feedback or any(word in text for word in understanding_words):
-        return "understanding", "학습자가 개념을 정확히 이해한 구간"
+    if any(word in text for word in understanding_words):
+        return "understanding", "학습자가 이해를 표현한 구간"
     if suggested_type in ("understanding", "confusion"):
         return suggested_type, suggested_reason or TIMELINE_TYPE_META[suggested_type]["label"]
-    return "confusion", "정답 여부가 명확히 확인되지 않아 보완이 필요한 구간"
+    return "understanding", "튜터 피드백이 중립적이라 이해로 분류"
+
+
+def _classify_user_messages_with_gemini(messages):
+    """학습자 답변만 AI 튜터 피드백 기준으로 understanding/confusion 분류."""
+    user_turns = []
+    for idx, msg in enumerate(messages):
+        if msg.get("role") != "user":
+            continue
+        user_turns.append({
+            "index": idx,
+            "question": _previous_assistant_text(messages, idx)[:600],
+            "answer": (msg.get("content") or "")[:900],
+            "tutor_feedback": _next_assistant_text(messages, idx)[:900],
+        })
+
+    if not user_turns:
+        return {}
+
+    prompt = f"""
+다음은 학생(user)과 AI 튜터(assistant)의 대화입니다.
+
+{json.dumps(user_turns, ensure_ascii=False)}
+
+각 user 답변마다 아래 기준으로 판단하세요.
+- understanding: 튜터의 직후 피드백이 정답/이해를 인정함 (예: 맞습니다, 정확합니다, 잘 이해, 좋습니다)
+- confusion: 학생이 모르겠다고 했거나, 튜터가 오답/오해/보완 필요를 명확히 지적함 (예: 틀렸, 맞지 않, 다시 생각, 오해)
+
+주의:
+- 튜터가 "맞습니다. 그런데/정확히는"처럼 칭찬 후 심화 질문을 하는 것은 understanding입니다.
+- "하지만", "다만", "정확히는"만 있다고 confusion으로 분류하지 마세요.
+- text는 학생 답변을 15~35자로 요약 (원문 복사 금지)
+- reason은 20~45자
+
+반드시 JSON 배열만 반환:
+[
+  {{"index": 3, "type": "understanding", "text": "대역폭 정의를 설명함", "reason": "튜터가 정답으로 인정"}}
+]
+"""
+
+    response = _client.models.generate_content(
+        model=_GEMINI_MODEL,
+        contents=[prompt],
+    )
+    parsed = _safe_json_loads(_generation_text(response))
+    if not isinstance(parsed, list):
+        raise ValueError("user classification must be list")
+
+    result = {}
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        idx = item.get("index")
+        t = item.get("type")
+        if idx is None or t not in ("understanding", "confusion"):
+            continue
+        result[int(idx)] = {
+            "type": t,
+            "text": item.get("text") or "",
+            "reason": item.get("reason") or TIMELINE_TYPE_META[t]["label"],
+        }
+    return result
 
 
 def build_timeline(messages):
+    user_ai_labels = {}
+    if _TIMELINE_USE_GEMINI and os.getenv("GEMINI_API_KEY"):
+        try:
+            user_ai_labels = _classify_user_messages_with_gemini(messages)
+        except Exception:
+            user_ai_labels = {}
+
     timeline = []
 
     for i, msg in enumerate(messages):
@@ -318,10 +421,18 @@ def build_timeline(messages):
             state = "start"
             reason = "대화를 시작한 지점"
         elif role == "user":
-            state, reason = _classify_user_timeline_state(messages, i)
+            ai_label = user_ai_labels.get(i)
+            if ai_label:
+                state = ai_label["type"]
+                reason = ai_label["reason"]
+                summary_text = ai_label["text"] or _summarize_timeline_message("user", text)
+            else:
+                state, reason = _classify_user_timeline_state(messages, i)
+                summary_text = _summarize_timeline_message("user", text)
         else:
             state = "progress"
             reason = "튜터가 질문 또는 피드백으로 학습을 진행"
+            summary_text = _summarize_timeline_message("assistant", text)
 
         meta = TIMELINE_TYPE_META[state]
 
@@ -331,7 +442,7 @@ def build_timeline(messages):
             "status": meta["label"],
             "color": meta["color"],
             "severity": meta["severity"],
-            "text": summarize_text(text),
+            "text": summary_text,
             "reason": reason,
             "response_delay_seconds": elapsed,
         })
@@ -339,6 +450,12 @@ def build_timeline(messages):
     return timeline
 
 def build_timeline_with_gemini(messages):
+    user_ai_labels = {}
+    try:
+        user_ai_labels = _classify_user_messages_with_gemini(messages)
+    except Exception:
+        user_ai_labels = {}
+
     chat_text = "\n".join([
         (
             f'{m["role"]}'
@@ -415,25 +532,37 @@ start, progress, confusion, understanding
             if t not in TIMELINE_TYPE_META:
                 t = "start" if idx == 0 else "progress"
             if role == "user":
-                t, fallback_reason = _classify_user_timeline_state(
-                    messages,
-                    idx,
-                    suggested_type=t,
-                    suggested_reason=item.get("reason"),
-                )
+                ai_label = user_ai_labels.get(idx)
+                if ai_label:
+                    final_type = ai_label["type"]
+                    final_reason = ai_label["reason"]
+                    summary_text = ai_label["text"] or item.get("text") or _summarize_timeline_message("user", messages[idx]["content"])
+                elif t in ("understanding", "confusion"):
+                    final_type = t
+                    final_reason = item.get("reason") or TIMELINE_TYPE_META[t]["label"]
+                    summary_text = item.get("text") or _summarize_timeline_message("user", messages[idx]["content"])
+                else:
+                    final_type, final_reason = _classify_user_timeline_state(
+                        messages,
+                        idx,
+                        suggested_type=t,
+                        suggested_reason=item.get("reason"),
+                    )
+                    summary_text = item.get("text") or _summarize_timeline_message("user", messages[idx]["content"])
             else:
-                t = "start" if idx == 0 else "progress"
-                fallback_reason = "튜터가 질문 또는 피드백으로 학습을 진행"
-            meta = TIMELINE_TYPE_META[t]
+                final_type = "start" if idx == 0 else "progress"
+                final_reason = item.get("reason") or "튜터가 질문 또는 피드백으로 학습을 진행"
+                summary_text = item.get("text") or _summarize_timeline_message("assistant", messages[idx]["content"])
+            meta = TIMELINE_TYPE_META[final_type]
             elapsed = _elapsed_from_previous(messages, idx)
             normalized.append({
                 "role": role,
-                "type": t,
+                "type": final_type,
                 "status": meta["label"],
                 "color": meta["color"],
                 "severity": meta["severity"],
-                "text": item.get("text") or summarize_text(messages[idx]["content"]),
-                "reason": fallback_reason if role == "user" else item.get("reason") or fallback_reason,
+                "text": summary_text,
+                "reason": final_reason,
                 "response_delay_seconds": elapsed,
             })
         if len(normalized) != len(messages):
@@ -445,17 +574,22 @@ start, progress, confusion, understanding
 
 def generate_learning_report(messages):
     words = extract_keywords(messages)
-
-    concept_freq = Counter(words)
+    concept_freq = _filter_concept_freq(Counter(words))
 
     if _REPORT_USE_GEMINI:
         tree_result = build_tree_with_gemini(messages, concept_freq)
-        timeline = build_timeline_with_gemini(messages)
     else:
         tree_result = {
             "tree": build_tree(messages, concept_freq),
             "mindmap": build_detailed_tree(messages, concept_freq),
         }
+
+    if _TIMELINE_USE_GEMINI and os.getenv("GEMINI_API_KEY"):
+        try:
+            timeline = build_timeline_with_gemini(messages)
+        except Exception:
+            timeline = build_timeline(messages)
+    else:
         timeline = build_timeline(messages)
 
     return {

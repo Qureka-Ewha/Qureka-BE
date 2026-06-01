@@ -12,6 +12,8 @@ from google import genai
 from google.genai import types
 from dotenv import load_dotenv
 
+from app.services import academic_concepts as ac
+
 load_dotenv()
 
 SourceKind = Literal["pdf", "transcript"]
@@ -154,6 +156,26 @@ def extract_from_pdf(file_bytes: bytes) -> List[Tuple[str, int]]:
 # 2. 소크라테스식 AI 튜터 'Qureka' 핵심 로직
 # -------------------------------------------------
 
+def _matches_structural_heading(text: str) -> bool:
+    return ac.matches_structural_heading(text)
+
+
+def _is_structural_keyword(term: str) -> bool:
+    return ac.is_structural_keyword(term)
+
+
+def _slide_heading(text: str) -> str:
+    return ac.slide_heading(text)
+
+
+def _is_structural_slide_text(text: str) -> bool:
+    return ac.is_structural_slide_text(text)
+
+
+def _document_meta_exclusion_prompt_block(is_transcript: bool = False) -> str:
+    return ac.academic_extraction_prompt_block(is_transcript)
+
+
 def get_qureka_system_prompt(
     dept: str | None,
     grade: int | None,
@@ -195,8 +217,31 @@ def get_qureka_system_prompt(
         if is_transcript
         else "> Qureka: 괜찮습니다. [슬라이드 4]를 보면 CPU의 사이클 타임과 IPC의 관계가 나오는데, 여기서 IPC가 고정되었을 때 성능을 높일 수 있는 다른 변수는 무엇이었나요?"
     )
+    meta_exclusion_block = _document_meta_exclusion_prompt_block(is_transcript)
+    meta_few_shot_block = f"""
+[Few-shot: 질문 주제 선정 — 반드시 준수]
+
+❌ 절대 금지:
+> Qureka: "Goal의 의미와 중요성을 설명해보세요."
+> Qureka: "Chapter 1이 무엇인가요?"
+> Qureka: "Objective와 Target의 차이는?"
+> Qureka: "Introduction이 왜 중요한가요?"
+
+✅ 올바름:
+> (제목: Learning Goal / 본문: 프로토콜, 라우팅) → Goal 무시
+> Qureka: "강의안에서 언급된 '프로토콜'의 핵심 역할이 무엇인지, 왜 필요한지 직관적으로 설명해 줄 수 있나요?"
+> (제목: Overview / 본문: Internet, Protocol, Network core 나열) → Overview 무시, 질문 Skip
+> (좌측 "Get feel..." 문장의 Get 단독 추출 금지 → 본문의 Protocol, Network edge 사용)
+> (Goal·목차만 있음 → 질문 없음, 다음 {('슬라이드' if not is_transcript else '구간')}로 Skip)
+"""
     return f"""
 시스템 프롬프트: 소크라테스식 AI 튜터 'Qureka'
+
+0. 최우선 절대 규칙 — 질문 주제는 Core Academic Concept Only
+{meta_exclusion_block}
+- 이 규칙은 Role, 소크라테스 전략, Few-shot 예시 등 모든 하위 지침보다 항상 우선합니다. 충돌 시 무조건 이 규칙을 따르세요.
+- 출력 직전 자가 검증: 질문의 핵심 명사가 Goal/Chapter/Slide/Introduction/목표/목차 등 메타 단어면 즉시 폐기하고, 본문의 전공 개념으로만 다시 작성하세요.
+{meta_few_shot_block}
 
 1. Role & Context (역할 및 맥락)
 - 당신은 누구인가: 자기주도 학습을 돕는 AI 튜터 'Qureka'입니다.
@@ -212,9 +257,11 @@ A. 엄격한 자료 기반성 (Strict Grounding)
 - 강의 자료 범위를 벗어난 질문에는 "해당 내용은 강의 자료에서 확인할 수 없습니다."라고 밝히고, 자료 내의 연관된 주제로 대화를 이끄세요.
 - 배경지식을 활용하되, 정답의 근거는 반드시 강의 자료에서 찾아야 합니다.
 - 학생 답변을 평가할 때는 표현의 일치보다 개념적 타당성과 강의 자료 핵심 의미의 일치 여부를 우선 판단하세요.
-- 강의 자료에서 반복되거나 강조된 개념, 제목, 도식 설명을 우선적으로 핵심 개념으로 간주하세요.
+- 강의 자료에서 반복되거나 강조된 개념, 도식·본문 설명을 우선적으로 핵심 개념으로 간주하세요.
+- Section 0의 메타 단어(Goal, Chapter, Slide, Objective, 목표, 목차 등)는 어떤 경우에도 핵심 개념이 아닙니다.
 
 B. 소크라테스식 질문 전략 (Socratic Method)
+- 새 개념에 대한 첫 질문은 반드시 기초 정의·직관 수준에서 시작하고, 이후 응답에 따라 점진적으로 심화하세요.
 - 정답 제시 금지: 학생에게 절대 정답을 먼저 말하지 마세요. 질문을 통해 학생이 스스로 답을 도출하게 하세요.
 - 질문 유형:
   - '왜(Why)', '어떻게(How)', '비교하면(Compare)' 등의 발문을 사용하여 사고를 확장시키세요.
@@ -324,8 +371,19 @@ def select_key_chunks(lecture_pages, max_pages=3, include_page_tag=True):
     else:
         pages_for_selection = clean_pages
 
-    first_page = pages_for_selection[0]   # 첫 페이지는 무조건 포함
-    others = pages_for_selection[1:]
+    substantive_pages = [
+        (text, page_num)
+        for text, page_num in pages_for_selection
+        if not _is_structural_slide_text(text) and not ac.is_overview_roadmap_slide(text)
+    ]
+    ordered_pages = substantive_pages or [
+        (text, page_num)
+        for text, page_num in pages_for_selection
+        if not _is_structural_slide_text(text)
+    ] or pages_for_selection
+
+    first_page = ordered_pages[0]
+    others = ordered_pages[1:]
 
     scored = []
 
@@ -355,26 +413,44 @@ def select_key_chunks(lecture_pages, max_pages=3, include_page_tag=True):
 
 
 def _extract_initial_question_topic(selected_text: str, lecture_title: str) -> str:
-    text_without_tags = re.sub(r"\[슬라이드\s+\d+\]", " ", selected_text or "")
-    key_terms = re.findall(r"[가-힣A-Za-z][가-힣A-Za-z0-9_-]{1,}", text_without_tags)
-    stop = {
-        "그리고", "하지만", "있는", "없는", "것은", "것이", "이를",
-        "에서", "으로", "한다", "합니다", "자료", "강의", "슬라이드",
-        "None", "none", "NULL", "null", "입니다", "습니다", "대한",
-    }
-    candidates = [
-        term
-        for term in key_terms
-        if term not in stop and term.lower() not in ("none", "null")
-    ]
-    return candidates[0] if candidates else (lecture_title or "핵심 개념")
+    return ac.pick_best_academic_concept(selected_text, lecture_title)
 
 
 def _first_valid_slide_number(lecture_pages) -> int | None:
+    for text, page_num in lecture_pages:
+        if (
+            _valid_slide_number(page_num)
+            and not _is_structural_slide_text(text)
+            and not ac.is_overview_roadmap_slide(text)
+        ):
+            return page_num
+    for text, page_num in lecture_pages:
+        if _valid_slide_number(page_num) and not _is_structural_slide_text(text):
+            return page_num
     for _, page_num in lecture_pages:
         if _valid_slide_number(page_num):
             return page_num
     return None
+
+
+def _first_question_source_pages(lecture_pages) -> tuple[str, int | None]:
+    """질문 생성용: Overview/목차 슬라이드를 건너뛴 텍스트와 슬라이드 번호."""
+    chunks = []
+    slide_num = None
+    for text, page_num in lecture_pages:
+        if not (text or "").strip():
+            continue
+        if ac.is_overview_roadmap_slide(text) or _is_structural_slide_text(text):
+            continue
+        if _valid_slide_number(page_num):
+            chunks.append(f"[슬라이드 {page_num}]\n{text.strip()}")
+            if slide_num is None:
+                slide_num = page_num
+        else:
+            chunks.append(text.strip())
+        if len(chunks) >= 3:
+            break
+    return "\n\n".join(chunks), slide_num
 
 def generate_initial_question(
     lecture_pages,
@@ -384,32 +460,44 @@ def generate_initial_question(
     source_kind: SourceKind = "pdf",
 ) -> str:
     """강의 자료 확정 시 사용자의 학과/학년에 맞춘 첫 번째 질문 생성"""
-    selected_text = select_key_chunks(
-        lecture_pages,
-        include_page_tag=(source_kind == "pdf"),
-    )
+    if source_kind == "pdf":
+        question_text, slide_number = _first_question_source_pages(lecture_pages)
+        if not question_text:
+            question_text = select_key_chunks(
+                lecture_pages,
+                include_page_tag=True,
+            )
+    else:
+        question_text = select_key_chunks(
+            lecture_pages,
+            include_page_tag=False,
+        )
+        slide_number = None
+
     if os.getenv("INITIAL_QUESTION_USE_GEMINI", "").lower() not in ("1", "true", "yes"):
-        topic = _extract_initial_question_topic(selected_text, lecture_title)
-        slide_number = _first_valid_slide_number(lecture_pages)
+        topic = ac.pick_best_academic_concept(question_text, lecture_title)
         if source_kind == "pdf" and slide_number is not None:
             source_phrase = f"슬라이드 {slide_number}에서"
         elif source_kind == "transcript":
             source_phrase = "녹음 자료에서"
         else:
             source_phrase = "강의 자료에서"
-        return (
-            f"{source_phrase} 먼저 '{topic}' 개념을 짚어볼게요. "
-            f"'{topic}'이 어떤 의미이고 왜 중요한지 설명해볼 수 있나요?"
-        )
+        return ac.format_first_socratic_question(topic, source_phrase)
 
     system_prompt = get_qureka_system_prompt(dept, grade, lecture_title, source_kind)
     prompt = f"""
     {system_prompt}
     
     [강의 내용]
-    {selected_text}
+    {question_text}
 
     위 강의 자료를 바탕으로 학생의 이해도를 점검할 수 있는 심도 있는 첫 질문을 생성하세요.
+    Overview/Roadmap/목차 슬라이드는 Skip하고, 상세 설명 슬라이드의 전공 명사만 주제로 하세요.
+
+    [첫 질문 생성 — 최우선 재확인]
+    {_document_meta_exclusion_prompt_block(source_kind == "transcript")}
+    - "X의 느낌/이미지" 질문 금지. "X의 핵심 역할과 왜 필요한지" 형태로 작성하세요.
+
     PDF 슬라이드 번호는 실제 [슬라이드 N] 태그가 있을 때만 언급하고, 절대로 "슬라이드 None" 또는 "None 개념"이라고 말하지 마세요.
     녹음/전사 자료에는 슬라이드 번호를 붙이지 말고 "녹음 자료"라고만 표현하세요.
     태그 없이 질문만 자연스럽게 출력하세요.
@@ -456,7 +544,10 @@ def generate_chat_response(
 
     학생의 마지막 답변이 강의 자료 핵심 개념과 일치하는지 먼저 판단하세요.
     핵심 개념이 빠졌다면 긍정 표현 없이 논리적 재질문으로 이어가세요.
-    
+
+    [다음 질문 생성 — 최우선 재확인]
+    {_document_meta_exclusion_prompt_block(source_kind == "transcript")}
+
     학생의 마지막 답변을 분석하여 짧은 피드백 후 자연스럽게 다음 질문을 이어서 제시하세요.
     태그 없이 실제 튜터처럼 출력하세요.
     """
