@@ -68,6 +68,14 @@ def _safe_json_loads(text: str):
         return json.loads(match.group(1))
 
 
+def _is_gemini_rate_limit_error(exc: Exception) -> bool:
+    status_code = getattr(exc, "status_code", None)
+    if status_code == 429:
+        return True
+    msg = str(exc).lower()
+    return "429" in msg or "resource_exhausted" in msg or "quota exceeded" in msg
+
+
 def _parse_datetime(value):
     if isinstance(value, datetime):
         return value
@@ -402,12 +410,17 @@ def _classify_user_messages_with_gemini(messages):
     return result
 
 
-def build_timeline(messages):
+def build_timeline(messages, *, use_gemini: bool | None = None):
+    if use_gemini is None:
+        use_gemini = _TIMELINE_USE_GEMINI and bool(os.getenv("GEMINI_API_KEY"))
+
     user_ai_labels = {}
-    if _TIMELINE_USE_GEMINI and os.getenv("GEMINI_API_KEY"):
+    if use_gemini:
         try:
             user_ai_labels = _classify_user_messages_with_gemini(messages)
-        except Exception:
+        except Exception as exc:
+            if _is_gemini_rate_limit_error(exc):
+                use_gemini = False
             user_ai_labels = {}
 
     timeline = []
@@ -420,6 +433,7 @@ def build_timeline(messages):
         if i == 0:
             state = "start"
             reason = "대화를 시작한 지점"
+            summary_text = _summarize_timeline_message(role, text)
         elif role == "user":
             ai_label = user_ai_labels.get(i)
             if ai_label:
@@ -453,7 +467,9 @@ def build_timeline_with_gemini(messages):
     user_ai_labels = {}
     try:
         user_ai_labels = _classify_user_messages_with_gemini(messages)
-    except Exception:
+    except Exception as exc:
+        if _is_gemini_rate_limit_error(exc):
+            return build_timeline(messages, use_gemini=False)
         user_ai_labels = {}
 
     chat_text = "\n".join([
@@ -569,7 +585,7 @@ start, progress, confusion, understanding
             raise ValueError("timeline length mismatch")
         return normalized
     except Exception:
-        return build_timeline(messages)
+        return build_timeline(messages, use_gemini=False)
 
 
 def generate_learning_report(messages):
@@ -588,9 +604,9 @@ def generate_learning_report(messages):
         try:
             timeline = build_timeline_with_gemini(messages)
         except Exception:
-            timeline = build_timeline(messages)
+            timeline = build_timeline(messages, use_gemini=False)
     else:
-        timeline = build_timeline(messages)
+        timeline = build_timeline(messages, use_gemini=False)
 
     return {
         "concept_frequency": dict(concept_freq.most_common(10)),
