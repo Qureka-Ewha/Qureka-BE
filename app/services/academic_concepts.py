@@ -58,9 +58,10 @@ KOREAN_ADJECTIVE_BLOCKLIST = frozenset({
 
 KOREAN_PARTICLE_SUFFIXES = (
     "이라고", "라고", "에서", "으로", "에게", "께서", "처럼", "까지", "부터",
-    "에는", "에는", "과는", "와는", "이란", "라는", "이라", "이란",
+    "에는", "과는", "와는", "이란", "라는", "이라", "이란",
+    "입니다", "습니다", "였습니다", "했습니다", "이고", "이며", "인데",
     "은", "는", "이", "가", "을", "를", "의", "에", "로", "와", "과", "도", "만",
-    "다", "요", "음", "함", "임", "됨", "있", "없", "하는", "된", "되는", "이다",
+    "요", "음", "함", "임", "됨", "있", "없", "하는", "된", "되는", "이다",
 )
 
 GENERIC_STOPWORDS = frozenset({
@@ -71,6 +72,44 @@ GENERIC_STOPWORDS = frozenset({
     "have", "has", "had", "will", "can", "may", "not", "but", "you", "your",
     "link", "links", "실제", "링크가", "처리량은", "최대",
 })
+
+# 일상·시간·지시·질문 표현 — 학술 개념 아님
+KOREAN_CONVERSATIONAL_BLOCKLIST = frozenset({
+    "매일", "매번", "항상", "가끔", "자주", "보통", "역시", "정말", "진짜", "아마", "그냥",
+    "아침", "점심", "저녁", "오늘", "내일", "어제", "방금", "지금", "나중", "먼저", "다음",
+    "무엇", "뭐", "뭔", "뭔가", "뭐야", "뭐예", "뭐에", "뭐를", "어떤", "어떻", "어떻게",
+    "왜", "언제", "어디", "누구", "얼마", "몇", "어느", "무슨",
+    "그것", "이것", "저것", "그거", "이거", "저거", "여기", "거기", "저기",
+    "그런", "이런", "저런", "그렇", "이렇", "저렇", "그래", "그리", "근데", "하지",
+    "하면", "하고", "해서", "인데", "일까", "수도", "같이", "처럼", "정도", "하나",
+    "둘", "셋", "번째", "우리", "저희", "여러분", "학생", "튜터", "사람",
+    "맞습", "맞아", "틀렸", "모르", "헷갈", "어렵", "쉽", "좋", "나쁘", "그렇군", "아하",
+    "공부", "복습", "예습", "수업", "교재", "시험", "문제", "답변", "질문", "대화",
+})
+
+# 학습 맥락 메타어 — 기술 개념 자체가 아님
+KOREAN_META_DISCOURSE_BLOCKLIST = frozenset({
+    "역할", "의미", "개념", "중요", "필요", "가능", "기본", "간단", "자세", "예시",
+    "비교", "특징", "장점", "단점", "원리", "과정", "단계", "구조", "방법", "내용",
+    "부분", "관련", "핵심", "주요", "전체", "일반", "정의", "요약", "정리", "분석",
+    "학습", "강의", "강의안", "언급", "질문해볼", "설명해", "말해", "생각", "느낌",
+})
+
+KOREAN_SHORT_ACADEMIC_ALLOWLIST = frozenset({
+    "연결", "해시", "캐시", "병렬", "직렬", "동기", "비동", "노드", "링크", "포트",
+    "큐", "스택", "힙", "코어", "엣지",
+})
+
+_KOREAN_INFLECTED_SUFFIX = re.compile(
+    r"(?:"
+    r"이고|이며|이니|이다|입니다|합니다|됩니다|세요|어요|아요|게요|"
+    r"했|였|겠|거나|든지|라면|도록|면서|지만|"
+    r"스러|하게|"
+    r"적이|적인|적으|"
+    r"형입니다|형이|형적|"
+    r"지향적"
+    r")$"
+)
 
 # 단독으로 허용할 짧은 기술 약어
 TECH_ACRONYM_ALLOWLIST = frozenset({
@@ -178,6 +217,35 @@ def _is_english_verb_only(token: str) -> bool:
     return False
 
 
+def _is_korean_conversational(norm: str) -> bool:
+    if not norm:
+        return True
+    if norm in KOREAN_CONVERSATIONAL_BLOCKLIST:
+        return True
+    if norm in KOREAN_META_DISCOURSE_BLOCKLIST:
+        return True
+    if norm in GENERIC_STOPWORDS:
+        return True
+    if _KOREAN_INFLECTED_SUFFIX.search(norm):
+        return True
+    if len(norm) <= 2 and norm.startswith(("뭐", "왜", "무", "몇")):
+        return True
+    return False
+
+
+def is_conversational_term(term: str) -> bool:
+    """일상어·메타어 등 학술 개념이 아닌 표현인지."""
+    raw = (term or "").strip()
+    if not raw:
+        return True
+    if is_valid_academic_phrase(raw):
+        return False
+    if re.search(r"[가-힣]", raw):
+        norm = normalize_korean_noun(raw.split()[0])
+        return _is_korean_conversational(norm)
+    return False
+
+
 def is_valid_academic_token(token: str) -> bool:
     """단일 토큰이 학술 명사 후보인지 (동사·형용사·조사·메타 단어 제외)."""
     raw = (token or "").strip()
@@ -205,6 +273,12 @@ def is_valid_academic_token(token: str) -> bool:
         if norm in KOREAN_ADJECTIVE_BLOCKLIST or norm in GENERIC_STOPWORDS:
             return False
         if is_structural_keyword(norm):
+            return False
+        if _is_korean_conversational(norm):
+            return False
+        if len(norm) == 2 and norm not in KOREAN_SHORT_ACADEMIC_ALLOWLIST:
+            return False
+        if len(norm) == 3 and _is_korean_conversational(norm[:2]):
             return False
         return True
 
@@ -241,9 +315,33 @@ def _score_phrase(phrase: str, freq: int = 1) -> float:
         score += 3.0
     if p.lower() in TECH_ACRONYM_ALLOWLIST:
         score += 5.0
-    if _is_english_verb_only(p.split()[0].lower() if p.split() else ""):
+    first = p.split()[0] if p.split() else ""
+    if re.fullmatch(r"[A-Za-z]+", first) and _is_english_verb_only(first.lower()):
         score -= 50.0
+    if re.search(r"[가-힣]", p):
+        norm = normalize_korean_noun(p.split()[0])
+        if _is_korean_conversational(norm):
+            score -= 100.0
+        elif len(norm) == 2 and norm not in KOREAN_SHORT_ACADEMIC_ALLOWLIST:
+            score -= 40.0
+        elif len(norm) >= 4:
+            score += 6.0
     return score
+
+
+def _extract_korean_tokens(line: str) -> list[str]:
+    """공백·구두점 단위로 나눈 뒤 학술 명사 후보만 추출 (문장 전체 슬라이싱 금지)."""
+    tokens: list[str] = []
+    for segment in re.split(r"[\s,.;:!?\"'()\[\]{}·…—–\-/\\|<>]+", line):
+        segment = segment.strip()
+        if not segment or not re.search(r"[가-힣]", segment):
+            continue
+        if re.fullmatch(r"[가-힣]{2,}", segment):
+            tokens.append(segment)
+            continue
+        for run in re.findall(r"[가-힣]{3,}", segment):
+            tokens.append(run)
+    return tokens
 
 
 def extract_academic_noun_phrases(text: str) -> list[tuple[str, float]]:
@@ -267,7 +365,7 @@ def extract_academic_noun_phrases(text: str) -> list[tuple[str, float]]:
                 display = _format_phrase_label(phrase)
                 counter[display] += 1
 
-        for token in re.findall(r"[가-힣]{2,}", line):
+        for token in _extract_korean_tokens(line):
             norm = normalize_korean_noun(token)
             if is_valid_academic_token(norm):
                 counter[norm] += 1
@@ -277,7 +375,7 @@ def extract_academic_noun_phrases(text: str) -> list[tuple[str, float]]:
         for phrase, count in counter.items()
     ]
     ranked.sort(key=lambda x: x[1], reverse=True)
-    return ranked
+    return [(phrase, score) for phrase, score in ranked if score > 0]
 
 
 def _format_phrase_label(phrase: str) -> str:
@@ -381,6 +479,7 @@ def mindmap_keyword_prompt_block() -> str:
 - 단독 동사(Get, Run, Set), 형용사(실제, 최대), 조사 포함 형태(링크가) 절대 금지.
 - 문맥 없이 토큰 1개씩 쪼개지 말 것. Network core, Network edge, Protocol, Internet처럼 의미 덩어리로 추출.
 - Goal, Chapter, Overview, Roadmap, Approach, Title 등 메타 단어는 노드에 넣지 말 것.
+- 매일, 아침, 뭐, 어떤, 하나, 역할, 공부, 질문, 그렇군요 같은 일상·대화 표현은 절대 넣지 말 것.
 - 학생 답변에서 나온 단어보다, 대화·강의에서 실제로 학습한 기술 개념을 우선하세요.
 - 한국어는 조사 제거 후 명사 기본형만 (처리량은 → 처리량).
 """

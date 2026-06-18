@@ -97,14 +97,116 @@ def _elapsed_from_previous(messages, idx: int) -> int | None:
     return max(0, int((cur - prev).total_seconds()))
 
 
-def extract_keywords(messages):
-    """대화 전체에서 전공 학술 명사/명사구만 추출 (단어 단위 분할 금지)."""
-    words = []
+def extract_concept_freq(messages) -> Counter:
+    """튜터(assistant) 발화를 우선해 학술 개념 빈도 집계."""
+    freq = Counter()
     for msg in messages:
         content = msg.get("content") or ""
-        for phrase, _ in ac.extract_academic_noun_phrases(content):
-            words.append(phrase)
+        role = msg.get("role") or "user"
+        role_weight = 3 if role == "assistant" else 1
+        for phrase, score in ac.extract_academic_noun_phrases(content):
+            if score <= 0:
+                continue
+            freq[phrase] += role_weight
+    return freq
+
+
+def extract_keywords(messages):
+    """하위 호환 — extract_concept_freq 결과를 flat list로 반환."""
+    freq = extract_concept_freq(messages)
+    words = []
+    for phrase, count in freq.items():
+        words.extend([phrase] * count)
     return words
+
+
+def _valid_mindmap_label(label: str) -> bool:
+    text = re.sub(r"\s+", " ", (label or "").strip())
+    if not text:
+        return False
+    return ac.is_valid_academic_phrase(text)
+
+
+def _sanitize_nested_tree(tree: dict) -> dict:
+    if not isinstance(tree, dict):
+        return {}
+
+    def sanitize_branch(key, value):
+        label = str(key or "").strip()
+        if not _valid_mindmap_label(label):
+            return None
+        if isinstance(value, list):
+            children = [str(v).strip() for v in value if _valid_mindmap_label(str(v))]
+            return children
+        if isinstance(value, dict):
+            nested = {}
+            for child_key, child_val in value.items():
+                sanitized = sanitize_branch(child_key, child_val)
+                if sanitized is None:
+                    continue
+                if isinstance(sanitized, list) and not sanitized:
+                    continue
+                if isinstance(sanitized, dict) and not sanitized:
+                    continue
+                nested[str(child_key).strip()] = sanitized
+            return nested
+        return value
+
+    sanitized = {}
+    for key, value in tree.items():
+        branch = sanitize_branch(key, value)
+        if branch is None:
+            continue
+        if isinstance(branch, (dict, list)) and not branch:
+            continue
+        sanitized[str(key).strip()] = branch
+    return sanitized
+
+
+def _sanitize_mindmap(mindmap: dict, concept_freq: Counter | None = None) -> dict:
+    if not isinstance(mindmap, dict):
+        return {"root": "", "nodes": [], "edges": []}
+
+    nodes = []
+    kept_ids: set[str] = set()
+
+    for raw in mindmap.get("nodes") or []:
+        if not isinstance(raw, dict):
+            continue
+        label = str(raw.get("label") or raw.get("id") or "").strip()
+        if not _valid_mindmap_label(label):
+            continue
+        if ac.is_conversational_term(label):
+            continue
+        node_id = str(raw.get("id") or label)
+        kept_ids.add(node_id)
+        nodes.append({
+            "id": node_id,
+            "label": label,
+            "level": raw.get("level", 1),
+            "weight": raw.get("weight", 1),
+            "summary": raw.get("summary") or "",
+        })
+
+    edges = []
+    for raw in mindmap.get("edges") or []:
+        if not isinstance(raw, dict):
+            continue
+        src = str(raw.get("from") or "").strip()
+        dst = str(raw.get("to") or "").strip()
+        if src in kept_ids and dst in kept_ids:
+            edges.append({
+                "from": src,
+                "to": dst,
+                "label": raw.get("label") or "관련",
+            })
+
+    root = str(mindmap.get("root") or "").strip()
+    if root not in kept_ids:
+        root_node = next((n for n in nodes if n.get("level") == 0), None)
+        root = root_node["id"] if root_node else (nodes[0]["id"] if nodes else "")
+
+    return {"root": root, "nodes": nodes, "edges": edges}
 
 
 def _filter_concept_freq(concept_freq: Counter) -> Counter:
@@ -172,6 +274,21 @@ def build_detailed_tree(messages, concept_freq):
         "edges": edges,
     }
 
+
+def _finalize_tree_result(tree: dict, mindmap: dict, concept_freq: Counter) -> dict:
+    sanitized_tree = _sanitize_nested_tree(tree)
+    sanitized_mindmap = _sanitize_mindmap(mindmap, concept_freq)
+
+    if not sanitized_tree:
+        sanitized_tree = _sanitize_nested_tree(build_tree([], concept_freq))
+    if not sanitized_mindmap.get("nodes"):
+        sanitized_mindmap = _sanitize_mindmap(build_detailed_tree([], concept_freq), concept_freq)
+
+    return {
+        "tree": sanitized_tree,
+        "mindmap": sanitized_mindmap,
+    }
+
 def build_tree_with_gemini(messages, concept_freq):
     concept_freq = _filter_concept_freq(concept_freq)
     if not concept_freq:
@@ -200,6 +317,8 @@ def build_tree_with_gemini(messages, concept_freq):
 
 규칙:
 - 학생이 실제로 고민하거나 답한 내용과 강의에서 학습한 기술 개념을 중심으로 판단하세요.
+- 일상어·시간 표현·질문 표현(매일, 뭐, 어떤, 역할, 하나, 공부, 질문 등)은 nodes/tree에 절대 넣지 마세요.
+- nodes는 [추출 후보 참고] 목록 안의 학술 명사·명사구 위주로만 구성하세요. 목록에 없는 단어도 학술 개념이면 허용합니다.
 - 중심 개념 1개, 주요 하위 개념 4~7개, 필요 시 세부 개념 1~3개씩 포함하세요.
 - nodes는 8~18개 정도로 구성하세요. 대화가 짧으면 가능한 범위에서만 작성하세요.
 - weight는 대화에서의 중요도/빈도를 1~5 정수로 표시하세요.
@@ -239,19 +358,21 @@ def build_tree_with_gemini(messages, concept_freq):
             tree = data.get("tree")
             mindmap = data.get("mindmap")
             if isinstance(tree, dict) and isinstance(mindmap, dict):
-                return {"tree": tree, "mindmap": mindmap}
+                return _finalize_tree_result(tree, mindmap, concept_freq)
         if isinstance(data, dict):
-            return {
-                "tree": data,
-                "mindmap": build_detailed_tree(messages, concept_freq),
-            }
+            return _finalize_tree_result(
+                data if isinstance(data, dict) else {},
+                build_detailed_tree(messages, concept_freq),
+                concept_freq,
+            )
     except Exception:
         pass
 
-    return {
-        "tree": build_tree(messages, concept_freq),
-        "mindmap": build_detailed_tree(messages, concept_freq),
-    }
+    return _finalize_tree_result(
+        build_tree(messages, concept_freq),
+        build_detailed_tree(messages, concept_freq),
+        concept_freq,
+    )
 
 
 def summarize_text(text):
@@ -589,16 +710,16 @@ start, progress, confusion, understanding
 
 
 def generate_learning_report(messages):
-    words = extract_keywords(messages)
-    concept_freq = _filter_concept_freq(Counter(words))
+    concept_freq = _filter_concept_freq(extract_concept_freq(messages))
 
     if _REPORT_USE_GEMINI:
         tree_result = build_tree_with_gemini(messages, concept_freq)
     else:
-        tree_result = {
-            "tree": build_tree(messages, concept_freq),
-            "mindmap": build_detailed_tree(messages, concept_freq),
-        }
+        tree_result = _finalize_tree_result(
+            build_tree(messages, concept_freq),
+            build_detailed_tree(messages, concept_freq),
+            concept_freq,
+        )
 
     if _TIMELINE_USE_GEMINI and os.getenv("GEMINI_API_KEY"):
         try:
